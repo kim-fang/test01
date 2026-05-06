@@ -64,6 +64,21 @@ type ImportPreview = {
   rows: NetworkPointImportRow[];
 };
 
+type SaveFilePickerWindow = Window & {
+  showSaveFilePicker?: (options?: {
+    suggestedName?: string;
+    types?: Array<{
+      description: string;
+      accept: Record<string, string[]>;
+    }>;
+  }) => Promise<{
+    createWritable: () => Promise<{
+      write: (data: Blob | BufferSource | string) => Promise<void>;
+      close: () => Promise<void>;
+    }>;
+  }>;
+};
+
 const initialFilters: QueryFilters = {
   code: "",
   name: "",
@@ -72,6 +87,19 @@ const initialFilters: QueryFilters = {
   serviceType: "",
   owner: "",
 };
+
+const exportHeaders = [
+  "机构编号",
+  "机构名称",
+  "机构类型",
+  "服务类型",
+  "机构性质",
+  "机构状态",
+  "异常状态",
+  "所属机构",
+  "首分拨中心",
+  "备注",
+] as const;
 
 function formatTimestamp(value: string) {
   return new Intl.DateTimeFormat("zh-CN", {
@@ -113,6 +141,59 @@ function buildImportRow(source: Record<string, string>, rowNumber: number): Netw
   return row;
 }
 
+function buildExportFileName() {
+  const stamp = new Intl.DateTimeFormat("sv-SE", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  })
+    .format(new Date())
+    .replaceAll("-", "")
+    .replaceAll(":", "")
+    .replace(" ", "-");
+
+  return `网点管理导出-${stamp}.xlsx`;
+}
+
+async function saveWorkbookFile(workbook: XLSX.WorkBook, fileName: string) {
+  const buffer = XLSX.write(workbook, {
+    bookType: "xlsx",
+    type: "array",
+  });
+  const blob = new Blob([buffer], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  });
+  const pickerWindow = window as SaveFilePickerWindow;
+
+  if (pickerWindow.showSaveFilePicker) {
+    const handle = await pickerWindow.showSaveFilePicker({
+      suggestedName: fileName,
+      types: [
+        {
+          description: "Excel 工作簿",
+          accept: {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+          },
+        },
+      ],
+    });
+    const writable = await handle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+    return;
+  }
+
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
 export function MessageBoard() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -126,6 +207,7 @@ export function MessageBoard() {
   const [submitting, setSubmitting] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [page, setPage] = useState(1);
@@ -508,6 +590,65 @@ export function MessageBoard() {
     });
   }
 
+  async function handleExport() {
+    if (filteredRows.length === 0) {
+      setError(null);
+      setNotice("当前查询结果为空，暂无可导出的网点数据。");
+      return;
+    }
+
+    setExporting(true);
+    setError(null);
+    setNotice(null);
+
+    try {
+      const worksheet = XLSX.utils.aoa_to_sheet([
+        [...exportHeaders],
+        ...filteredRows.map((row) => [
+          row.code,
+          row.name,
+          row.branchType,
+          row.serviceType,
+          row.organizationType,
+          row.status,
+          row.anomalyStatus,
+          row.ownerOrganization,
+          row.hubCenter,
+          row.content,
+        ]),
+      ]);
+
+      worksheet["!cols"] = [
+        { wch: 16 },
+        { wch: 24 },
+        { wch: 16 },
+        { wch: 16 },
+        { wch: 16 },
+        { wch: 14 },
+        { wch: 14 },
+        { wch: 24 },
+        { wch: 22 },
+        { wch: 30 },
+      ];
+
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, worksheet, "网点管理");
+
+      await saveWorkbookFile(workbook, buildExportFileName());
+      setNotice(`导出成功，已生成 ${filteredRows.length} 条网点记录的 Excel 文件。`);
+    } catch (exportError) {
+      if (exportError instanceof DOMException && exportError.name === "AbortError") {
+        setNotice("已取消导出。");
+      } else {
+        const message =
+          exportError instanceof Error ? exportError.message : "导出失败，请稍后重试。";
+        setError(message);
+      }
+    } finally {
+      setExporting(false);
+    }
+  }
+
   async function handleImportChange(event: React.ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
 
@@ -805,8 +946,13 @@ export function MessageBoard() {
                 <button type="button" className="secondary-action" onClick={handleBatchDelete}>
                   删除选中
                 </button>
-                <button type="button" className="light-action">
-                  导出
+                <button
+                  type="button"
+                  className="light-action"
+                  onClick={() => void handleExport()}
+                  disabled={exporting}
+                >
+                  {exporting ? "导出中..." : "导出"}
                 </button>
                 <input
                   ref={fileInputRef}
