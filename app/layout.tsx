@@ -14,8 +14,8 @@ const bodyFont = Noto_Sans_SC({
 });
 
 export const metadata: Metadata = {
-  title: "Vercel 留言板",
-  description: "基于 Next.js API Routes 与 Postgres 的全栈留言板。",
+  title: "Vercel 网点管理台",
+  description: "基于 Next.js API Routes 与 Postgres 的网点管理后台示例。",
 };
 
 export default function RootLayout({
