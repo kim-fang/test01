@@ -160,28 +160,55 @@ EXECUTE FUNCTION set_timestamp();
 
 截至 `2026-04-28`，Vercel 官方文档说明原来的 “Vercel Postgres” 已不再对新项目开放，新的做法是在 Vercel 项目里添加 Postgres 集成（通常来自 Vercel Marketplace，例如 Neon）。这个项目已经按当前推荐方式接入了 Neon 的服务端驱动，同时兼容 `POSTGRES_URL` / `DATABASE_URL`。
 
-部署步骤：
+### 方式一：用 Vercel 控制台部署
 
 1. 把代码推到 Git 仓库。
-2. 在 Vercel 导入这个项目。
-3. 在项目的 Storage / Marketplace 里添加一个 Postgres 集成。
-4. 确认环境变量里已经有 `POSTGRES_URL`，如果你的提供商给的是 `DATABASE_URL` 也可以直接用。
-5. 在本地或数据库控制台执行 `sql/init.sql`，或者先拉取环境变量后运行：
+2. 在 Vercel 导入这个仓库。
+3. Vercel 会自动识别这是一个 Next.js 项目，构建命令默认就是 `npm run build`。
+4. 在项目的 `Storage` / `Marketplace` 里添加一个 Postgres 集成。
+5. 确认环境变量里已经出现 `POSTGRES_URL`，如果你的数据库提供商给的是 `DATABASE_URL` 也可以直接使用。
+6. 在数据库控制台执行 [sql/init.sql](./sql/init.sql)。
+7. 如果你希望部署后就能看到演示内容，再执行 [sql/seed.sql](./sql/seed.sql)。
+8. 重新触发一次部署。
+
+### 方式二：用 Vercel CLI 部署
+
+Vercel 官方 CLI 文档在 `2026-03-12` 的快速参考里给出的基本顺序是：`vercel link` -> `vercel env pull` -> `vercel deploy` -> `vercel deploy --prod`。
+
+如果你本机还没有安装全局 CLI，也可以直接用 `npx`：
 
 ```bash
+npx vercel@latest link
+npx vercel@latest env pull .env.local
 npm run db:init
-```
-
-6. 如果你希望一部署就看到演示内容，可以再执行：
-
-```bash
 npm run db:seed
+npx vercel@latest deploy
+npx vercel@latest deploy --prod
 ```
 
-7. 重新部署项目。
+说明：
+
+1. `link` 会把当前目录绑定到你的 Vercel 项目。
+2. `env pull` 会把 Vercel 上的环境变量拉到本地，方便你执行数据库初始化脚本。
+3. `db:init` 负责建表。
+4. `db:seed` 是可选的示例数据。
+5. `deploy` 先发预览环境。
+6. `deploy --prod` 再发正式环境。
+
+### 当前项目的部署准备
+
+这个仓库已经具备下面这些上线准备：
+
+- `vercel.json` 已声明 `nextjs` 框架
+- `.vercelignore` 已避免把本地构建产物和本地环境变量上传
+- `.env.example` 已提供环境变量模板
+- `npm run db:init` 和 `npm run db:seed` 已准备好
+- `npm run build` 已本地验证通过
 
 ## 官方参考
 
 - Vercel MCP 文档：https://vercel.com/docs/agent-resources/vercel-mcp
 - Vercel Postgres 文档：https://vercel.com/docs/postgres
+- Vercel CLI 概览：https://vercel.com/docs/cli
+- Vercel CLI 部署指南：https://vercel.com/docs/projects/deploy-from-cli
 - Neon Vercel 迁移指南：https://neon.com/docs/guides/vercel-postgres-transition-guide
