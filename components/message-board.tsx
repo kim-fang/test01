@@ -1,7 +1,15 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import type { Message, MessageInput } from "@/lib/types";
+import { useEffect, useMemo, useRef, useState } from "react";
+import * as XLSX from "xlsx";
+import type { Message, MessageInput, NetworkPointImportRow } from "@/lib/types";
+import {
+  anomalyStatusOptions,
+  networkPointHeaders,
+  ownerOrganizationOptions,
+  serviceTypeOptions,
+  statusOptions,
+} from "@/lib/validation";
 
 const emptyForm: MessageInput = {
   name: "",
@@ -31,35 +39,13 @@ const menuGroups = [
   },
 ];
 
-const branchTypes = ["一级网点", "二级网点", "三级网点", "直营服务部"];
-const serviceTypes = ["寄件服务", "冷链运输", "仓配服务", "派件服务"];
-const organizationTypes = ["市场部", "承包区", "一级网点", "二级网点"];
-const anomalyStatuses = ["正常", "筹备期", "观察中"];
-const ownerOrganizations = [
-  "上海市场部",
-  "杭州分拨中心",
-  "南京分拨中心",
-  "呼和浩特事业网点",
-  "郑州分拨中心",
-  "厦门分拨中心",
-];
-const hubCenters = [
-  "上海分拨中心",
-  "杭州分拨中心",
-  "南京分拨中心",
-  "郑州分拨中心",
-  "长沙分拨中心",
-  "厦门分拨中心",
-];
-const provinces = ["上海市", "浙江省", "江苏省", "河南省", "福建省", "内蒙古"];
-const departments = ["市场运营", "直营网点", "冷链车队", "直营网格", "客服中心"];
-
 type ApiSuccess<T> = {
   data: T;
 };
 
 type ApiError = {
   error?: string;
+  details?: string[];
 };
 
 type QueryFilters = {
@@ -73,22 +59,9 @@ type QueryFilters = {
 
 type PanelMode = "create" | "edit" | "view" | null;
 
-type BoardRow = {
-  id: string;
-  code: string;
-  name: string;
-  branchType: string;
-  serviceType: string;
-  organizationType: string;
-  status: string;
-  anomalyStatus: string;
-  ownerOrganization: string;
-  hubCenter: string;
-  province: string;
-  department: string;
-  content: string;
-  createdAt: string;
-  updatedAt: string;
+type ImportPreview = {
+  headers: string[];
+  rows: NetworkPointImportRow[];
 };
 
 const initialFilters: QueryFilters = {
@@ -110,36 +83,38 @@ function formatTimestamp(value: string) {
   }).format(new Date(value));
 }
 
-function deriveRow(message: Message, index: number): BoardRow {
-  const cleanedId = message.id.replace(/-/g, "");
-  const code = cleanedId.slice(0, 6).padEnd(6, `${(index + 3) % 10}`);
-  const status = index % 9 === 0 ? "筹备中" : "正常";
-  const anomalyStatus = anomalyStatuses[index % anomalyStatuses.length];
-
-  return {
-    id: message.id,
-    code,
-    name: message.name,
-    branchType: branchTypes[index % branchTypes.length],
-    serviceType: serviceTypes[index % serviceTypes.length],
-    organizationType: organizationTypes[index % organizationTypes.length],
-    status,
-    anomalyStatus,
-    ownerOrganization: ownerOrganizations[index % ownerOrganizations.length],
-    hubCenter: hubCenters[index % hubCenters.length],
-    province: provinces[index % provinces.length],
-    department: departments[index % departments.length],
-    content: message.content,
-    createdAt: message.createdAt,
-    updatedAt: message.updatedAt,
-  };
-}
-
 async function readJson<T>(response: Response): Promise<T> {
   return (await response.json()) as T;
 }
 
+function buildImportRow(source: Record<string, string>, rowNumber: number): NetworkPointImportRow {
+  const row = {
+    code: (source["机构编号"] ?? "").trim(),
+    name: (source["机构名称"] ?? "").trim(),
+    branchType: (source["机构类型"] ?? "").trim(),
+    serviceType: (source["服务类型"] ?? "").trim(),
+    organizationType: (source["机构性质"] ?? "").trim(),
+    status: (source["机构状态"] ?? "").trim(),
+    anomalyStatus: (source["异常状态"] ?? "").trim(),
+    ownerOrganization: (source["所属机构"] ?? "").trim(),
+    hubCenter: (source["首分拨中心"] ?? "").trim(),
+    content: (source["备注"] ?? "").trim(),
+  };
+
+  const missing = networkPointHeaders.filter((header) => {
+    const value = source[header] ?? "";
+    return value.toString().trim().length === 0;
+  });
+
+  if (missing.length > 0) {
+    throw new Error(`第 ${rowNumber} 行存在空字段：${missing.join("、")}`);
+  }
+
+  return row;
+}
+
 export function MessageBoard() {
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [filters, setFilters] = useState<QueryFilters>(initialFilters);
@@ -150,9 +125,11 @@ export function MessageBoard() {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [importing, setImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [page, setPage] = useState(1);
+  const [lastImportResult, setLastImportResult] = useState<string | null>(null);
 
   async function requestMessages(signal?: AbortSignal) {
     const response = await fetch("/api/messages", {
@@ -213,19 +190,21 @@ export function MessageBoard() {
     };
   }, []);
 
-  const rows = messages.map(deriveRow);
+  const rows = messages;
   const activeRow = activeId ? rows.find((row) => row.id === activeId) ?? null : null;
 
-  const filteredRows = rows.filter((row) => {
-    return (
-      (!filters.code || row.code.includes(filters.code.trim())) &&
-      (!filters.name || row.name.includes(filters.name.trim())) &&
-      (!filters.status || row.status === filters.status) &&
-      (!filters.anomaly || row.anomalyStatus === filters.anomaly) &&
-      (!filters.serviceType || row.serviceType === filters.serviceType) &&
-      (!filters.owner || row.ownerOrganization === filters.owner)
-    );
-  });
+  const filteredRows = useMemo(() => {
+    return rows.filter((row) => {
+      return (
+        (!filters.code || row.code.includes(filters.code.trim())) &&
+        (!filters.name || row.name.includes(filters.name.trim())) &&
+        (!filters.status || row.status === filters.status) &&
+        (!filters.anomaly || row.anomalyStatus === filters.anomaly) &&
+        (!filters.serviceType || row.serviceType === filters.serviceType) &&
+        (!filters.owner || row.ownerOrganization === filters.owner)
+      );
+    });
+  }, [filters, rows]);
 
   const pageSize = 10;
   const totalPages = Math.max(1, Math.ceil(filteredRows.length / pageSize));
@@ -244,7 +223,7 @@ export function MessageBoard() {
     setNotice(null);
   }
 
-  function openEditPanel(row: BoardRow) {
+  function openEditPanel(row: Message) {
     setPanelMode("edit");
     setActiveId(row.id);
     setForm({
@@ -254,7 +233,7 @@ export function MessageBoard() {
     setNotice(null);
   }
 
-  function openViewPanel(row: BoardRow) {
+  function openViewPanel(row: Message) {
     setPanelMode("view");
     setActiveId(row.id);
     setNotice(null);
@@ -450,6 +429,134 @@ export function MessageBoard() {
     }
   }
 
+  function parseWorkbook(file: File): Promise<ImportPreview> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+
+      reader.onload = () => {
+        try {
+          const workbook = XLSX.read(reader.result, { type: "array" });
+          const firstSheetName = workbook.SheetNames[0];
+
+          if (!firstSheetName) {
+            reject(new Error("Excel 中没有可用工作表。"));
+            return;
+          }
+
+          const worksheet = workbook.Sheets[firstSheetName];
+          const matrix = XLSX.utils.sheet_to_json<(string | number | null)[]>(worksheet, {
+            header: 1,
+            blankrows: false,
+          });
+
+          if (matrix.length === 0) {
+            reject(new Error("Excel 模板为空，请使用正确模板。"));
+            return;
+          }
+
+          const headers = (matrix[0] ?? []).map((cell) => `${cell ?? ""}`.trim());
+
+          if (
+            headers.length !== networkPointHeaders.length ||
+            networkPointHeaders.some((header, index) => headers[index] !== header)
+          ) {
+            reject(
+              new Error(
+                `模板表头不匹配。系统要求表头为：${networkPointHeaders.join("、")}`,
+              ),
+            );
+            return;
+          }
+
+          const rows = matrix
+            .slice(1)
+            .filter((row) => row.some((cell) => `${cell ?? ""}`.trim().length > 0))
+            .map((row, index) => {
+              const record = Object.fromEntries(
+                headers.map((header, headerIndex) => [
+                  header,
+                  `${row[headerIndex] ?? ""}`.trim(),
+                ]),
+              );
+
+              return buildImportRow(record, index + 2);
+            });
+
+          if (rows.length === 0) {
+            reject(new Error("Excel 中没有可导入的数据行。"));
+            return;
+          }
+
+          resolve({
+            headers,
+            rows,
+          });
+        } catch (parseError) {
+          reject(
+            parseError instanceof Error
+              ? parseError
+              : new Error("Excel 解析失败，请检查文件格式。"),
+          );
+        }
+      };
+
+      reader.onerror = () => {
+        reject(new Error("读取文件失败，请重试。"));
+      };
+
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  async function handleImportChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+
+    if (!file) {
+      return;
+    }
+
+    setImporting(true);
+    setError(null);
+    setNotice(null);
+    setLastImportResult(null);
+
+    try {
+      const preview = await parseWorkbook(file);
+      const response = await fetch("/api/messages/import", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(preview),
+      });
+      const payload = await readJson<
+        ApiSuccess<{ inserted: number; names: string[] }> & ApiError
+      >(response);
+
+      if (!response.ok) {
+        throw new Error(payload.details?.join("；") ?? payload.error ?? "导入失败。");
+      }
+
+      await loadMessages();
+      setNotice(`导入成功，共导入 ${payload.data.inserted} 条网点记录。`);
+      setLastImportResult(payload.data.names.join("、"));
+    } catch (importError) {
+      const message =
+        importError instanceof Error ? importError.message : "导入失败，请稍后重试。";
+      setError(message);
+    } finally {
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+
+      setImporting(false);
+    }
+  }
+
+  function triggerImport() {
+    fileInputRef.current?.click();
+  }
+
   function renderPageNumbers() {
     const pages: number[] = [];
     const start = Math.max(1, currentPage - 2);
@@ -486,10 +593,7 @@ export function MessageBoard() {
               <p>{group.title}</p>
               {group.items.map((item) => (
                 <div key={item.label} className="menu-entry">
-                  <button
-                    type="button"
-                    className={`menu-item${item.active ? " active" : ""}`}
-                  >
+                  <button type="button" className={`menu-item${item.active ? " active" : ""}`}>
                     <span className="menu-dot" />
                     {item.label}
                   </button>
@@ -543,7 +647,7 @@ export function MessageBoard() {
           <div className="content-header">
             <div>
               <p className="breadcrumb">经营管理中心 / 网点管理</p>
-              <h1>新增业务网点</h1>
+              <h1>网点管理台</h1>
             </div>
 
             <div className="content-tools">
@@ -559,6 +663,12 @@ export function MessageBoard() {
           {(error || notice) && (
             <div className={`alert-banner${error ? " error" : ""}`}>
               {error ?? notice}
+              {lastImportResult ? (
+                <>
+                  <br />
+                  导入成功的机构：{lastImportResult}
+                </>
+              ) : null}
             </div>
           )}
 
@@ -604,7 +714,7 @@ export function MessageBoard() {
                   }
                 >
                   <option value="">请选择</option>
-                  {ownerOrganizations.map((item) => (
+                  {ownerOrganizationOptions.map((item) => (
                     <option key={item} value={item}>
                       {item}
                     </option>
@@ -624,8 +734,11 @@ export function MessageBoard() {
                   }
                 >
                   <option value="">请选择</option>
-                  <option value="正常">正常</option>
-                  <option value="筹备中">筹备中</option>
+                  {statusOptions.map((item) => (
+                    <option key={item} value={item}>
+                      {item}
+                    </option>
+                  ))}
                 </select>
               </label>
 
@@ -641,7 +754,7 @@ export function MessageBoard() {
                   }
                 >
                   <option value="">请选择</option>
-                  {serviceTypes.map((item) => (
+                  {serviceTypeOptions.map((item) => (
                     <option key={item} value={item}>
                       {item}
                     </option>
@@ -661,7 +774,7 @@ export function MessageBoard() {
                   }
                 >
                   <option value="">请选择</option>
-                  {anomalyStatuses.map((item) => (
+                  {anomalyStatusOptions.map((item) => (
                     <option key={item} value={item}>
                       {item}
                     </option>
@@ -686,18 +799,32 @@ export function MessageBoard() {
                 <button type="button" className="primary-action" onClick={openCreatePanel}>
                   新增
                 </button>
+                <button type="button" className="secondary-action" onClick={triggerImport}>
+                  {importing ? "导入中..." : "导入 Excel"}
+                </button>
                 <button type="button" className="secondary-action" onClick={handleBatchDelete}>
                   删除选中
                 </button>
                 <button type="button" className="light-action">
                   导出
                 </button>
+                <input
+                  ref={fileInputRef}
+                  className="hidden-file-input"
+                  type="file"
+                  accept=".xlsx,.xls"
+                  onChange={handleImportChange}
+                />
               </div>
 
               <div className="toolbar-right">
                 <span>共 {filteredRows.length} 条</span>
                 <span>当前选中 {selectedIds.length} 条</span>
               </div>
+            </div>
+
+            <div className="import-tip">
+              导入模板表头需严格为：{networkPointHeaders.join("、")}。
             </div>
 
             <div className="table-wrap">
@@ -863,12 +990,12 @@ export function MessageBoard() {
                   <strong>{activeRow.ownerOrganization}</strong>
                 </div>
                 <div>
-                  <span>省份</span>
-                  <strong>{activeRow.province}</strong>
+                  <span>机构类型</span>
+                  <strong>{activeRow.branchType}</strong>
                 </div>
                 <div>
-                  <span>管理部门</span>
-                  <strong>{activeRow.department}</strong>
+                  <span>服务类型</span>
+                  <strong>{activeRow.serviceType}</strong>
                 </div>
                 <div>
                   <span>最后更新</span>
@@ -882,10 +1009,7 @@ export function MessageBoard() {
               </div>
             </div>
           ) : (
-            <form
-              className="detail-form"
-              onSubmit={panelMode === "create" ? handleCreate : handleUpdate}
-            >
+            <form className="detail-form" onSubmit={panelMode === "create" ? handleCreate : handleUpdate}>
               <label className="detail-field">
                 <span>机构名称</span>
                 <input
@@ -917,7 +1041,7 @@ export function MessageBoard() {
               </label>
 
               <div className="form-tip">
-                保存后会同步更新列表。当前版本仍然使用原有 API 与数据库结构。
+                保存后会同步更新列表。Excel 导入会按模板字段做表头和行数据校验。
               </div>
 
               <div className="detail-actions">

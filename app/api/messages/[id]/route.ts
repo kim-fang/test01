@@ -1,10 +1,6 @@
 import { NextResponse } from "next/server";
 import { ZodError } from "zod";
-import {
-  deleteMessage,
-  findMessageById,
-  updateMessage,
-} from "@/lib/messages";
+import { deleteMessage, findMessageById, updateMessage } from "@/lib/messages";
 import { messageIdSchema, messageInputSchema } from "@/lib/validation";
 
 export const runtime = "nodejs";
@@ -56,7 +52,7 @@ export async function GET(_: Request, context: RouteContext) {
     const data = await findMessageById(id);
 
     if (!data) {
-      return NextResponse.json({ error: "留言不存在。" }, { status: 404 });
+      return NextResponse.json({ error: "网点记录不存在。" }, { status: 404 });
     }
 
     return NextResponse.json({ data });
@@ -72,7 +68,7 @@ export async function PUT(request: Request, context: RouteContext) {
     const data = await updateMessage(id, payload);
 
     if (!data) {
-      return NextResponse.json({ error: "留言不存在。" }, { status: 404 });
+      return NextResponse.json({ error: "网点记录不存在。" }, { status: 404 });
     }
 
     return NextResponse.json({ data });
@@ -87,7 +83,7 @@ export async function DELETE(_: Request, context: RouteContext) {
     const deleted = await deleteMessage(id);
 
     if (!deleted) {
-      return NextResponse.json({ error: "留言不存在。" }, { status: 404 });
+      return NextResponse.json({ error: "网点记录不存在。" }, { status: 404 });
     }
 
     return NextResponse.json({ data: { deleted: true } });

@@ -1,15 +1,18 @@
 import { NextResponse } from "next/server";
 import { ZodError } from "zod";
-import { createMessage, listMessages } from "@/lib/messages";
-import { messageInputSchema } from "@/lib/validation";
+import { importMessages } from "@/lib/messages";
+import { importPayloadSchema } from "@/lib/validation";
 
 export const runtime = "nodejs";
 
 function handleRouteError(error: unknown) {
   if (error instanceof ZodError) {
+    const details = error.issues.map((issue) => issue.message);
+
     return NextResponse.json(
       {
-        error: "请求数据不合法：机构名称需为 1-80 字，备注需不超过 500 字。",
+        error: details[0] ?? "导入数据不合法。",
+        details,
       },
       { status: 400 },
     );
@@ -35,19 +38,10 @@ function handleRouteError(error: unknown) {
   );
 }
 
-export async function GET() {
-  try {
-    const data = await listMessages();
-    return NextResponse.json({ data });
-  } catch (error) {
-    return handleRouteError(error);
-  }
-}
-
 export async function POST(request: Request) {
   try {
-    const payload = messageInputSchema.parse(await request.json());
-    const data = await createMessage(payload);
+    const payload = importPayloadSchema.parse(await request.json());
+    const data = await importMessages(payload.rows);
     return NextResponse.json({ data }, { status: 201 });
   } catch (error) {
     return handleRouteError(error);
