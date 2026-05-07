@@ -343,7 +343,12 @@ export function createBlankOrderRow(rowNumber: number, sourceSheet = ""): OrderD
   };
 }
 
-export function duplicateMessagesForCode(rows: OrderDraftRow[], existingCodes: Set<string>) {
+type ExistingCodeIndex = {
+  set: Set<string>;
+  details?: Map<string, string>;
+};
+
+export function duplicateMessagesForCode(rows: OrderDraftRow[], existingCodes: ExistingCodeIndex) {
   const codeMap = new Map<string, number[]>();
 
   rows.forEach((row, index) => {
@@ -377,9 +382,13 @@ export function duplicateMessagesForCode(rows: OrderDraftRow[], existingCodes: S
       }
     }
 
-    if (existingCodes.has(code)) {
+    if (existingCodes.set.has(code)) {
+      const historyLabel = existingCodes.details?.get(code);
       for (const index of indices) {
-        pushRowError(index, "外部编码重复：与历史运单重复");
+        pushRowError(
+          index,
+          historyLabel ? `外部编码重复：与${historyLabel}重复` : "外部编码重复：与历史运单重复",
+        );
       }
     }
   }
@@ -387,7 +396,7 @@ export function duplicateMessagesForCode(rows: OrderDraftRow[], existingCodes: S
   return { rows: nextRows, messages: [] as string[] };
 }
 
-export function validateOrderRows(rows: OrderDraftRow[], existingCodes: Set<string>) {
+export function validateOrderRows(rows: OrderDraftRow[], existingCodes: ExistingCodeIndex) {
   const basicRows = rows.map((row) => ({
     ...row,
     errors: validateOrderValues(row.values),

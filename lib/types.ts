@@ -36,6 +36,16 @@ export type TemplateRuleMatchInfo = {
   score: number;
 };
 
+export type HistoryDuplicateReference = {
+  externalCode: string;
+  orderId: string;
+  submittedAt: string;
+  receiverName: string;
+  sourceTemplateName: string | null;
+  sourceSheetName: string | null;
+  displayLabel: string;
+};
+
 export type RawWorkbookContext = {
   sheets: Array<{
     sheetName: string;
@@ -55,6 +65,7 @@ export type ImportSessionPayload = {
   savedRule: SavedTemplateRule | null;
   supportedSheets: WorkbookSheetSnapshot[];
   existingExternalCodes: string[];
+  existingExternalCodeDetails: HistoryDuplicateReference[];
   templateRuleMatch: TemplateRuleMatchInfo;
   workbookContext: {
     sheets: Array<{

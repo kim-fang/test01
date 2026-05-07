@@ -2,6 +2,7 @@ import { getSql } from "@/lib/db";
 import { buildAutoMapping, normalizeHeader, orderFieldKeys } from "@/lib/order";
 import type {
   HistoryListPayload,
+  HistoryDuplicateReference,
   OrderDraftRow,
   OrderHistoryItem,
   SavedTemplateRule,
@@ -213,19 +214,53 @@ export async function saveTemplateRule(rule: SavedTemplateRule) {
 export async function listExistingExternalCodes() {
   const sql = getSql();
   const rows = (await sql`
-    SELECT external_code
+    SELECT
+      id,
+      external_code,
+      receiver_name,
+      source_template_name,
+      source_sheet_name,
+      created_at
     FROM shipping_orders
     WHERE external_code IS NOT NULL
       AND external_code <> '';
-  `) as Array<{ external_code: string | null }>;
+  `) as Array<{
+    id: string;
+    external_code: string | null;
+    receiver_name: string;
+    source_template_name: string | null;
+    source_sheet_name: string | null;
+    created_at: Date | string;
+  }>;
 
-  const codes = rows
-    .map((row) => row.external_code?.trim().toLowerCase())
-    .filter((value): value is string => Boolean(value));
+  const latestByCode = new Map<string, HistoryDuplicateReference>();
+
+  for (const row of rows.sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime())) {
+    const code = row.external_code?.trim().toLowerCase();
+    if (!code || latestByCode.has(code)) {
+      continue;
+    }
+
+    const submittedAt = new Date(row.created_at).toISOString();
+    const displayLabel = `历史运单（${new Date(row.created_at).toLocaleString("zh-CN")}${
+      row.receiver_name ? `，收件人：${row.receiver_name}` : ""
+    }）`;
+
+    latestByCode.set(code, {
+      externalCode: code,
+      orderId: row.id,
+      submittedAt,
+      receiverName: row.receiver_name,
+      sourceTemplateName: row.source_template_name,
+      sourceSheetName: row.source_sheet_name,
+      displayLabel,
+    });
+  }
 
   return {
-    set: new Set(codes),
-    list: [...new Set(codes)],
+    set: new Set(latestByCode.keys()),
+    list: [...latestByCode.keys()],
+    details: [...latestByCode.values()],
   };
 }
 

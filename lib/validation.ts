@@ -64,6 +64,16 @@ export const templateRuleMatchSchema = z.object({
   score: z.number().min(0).max(1),
 });
 
+export const historyDuplicateReferenceSchema = z.object({
+  externalCode: z.string().min(1),
+  orderId: z.string().min(1),
+  submittedAt: z.string().min(1),
+  receiverName: z.string().min(1),
+  sourceTemplateName: z.string().nullable(),
+  sourceSheetName: z.string().nullable(),
+  displayLabel: z.string().min(1),
+});
+
 export const importSessionPayloadSchema = z.object({
   fileName: z.string().min(1),
   selectedSheetName: z.string().min(1),
@@ -76,6 +86,7 @@ export const importSessionPayloadSchema = z.object({
   savedRule: savedTemplateRuleSchema.nullable(),
   supportedSheets: z.array(workbookSheetSnapshotSchema),
   existingExternalCodes: z.array(z.string()),
+  existingExternalCodeDetails: z.array(historyDuplicateReferenceSchema),
   templateRuleMatch: templateRuleMatchSchema,
   workbookContext: z.object({
     sheets: z.array(

@@ -16,6 +16,7 @@ import {
   saveTemplateRule,
 } from "@/lib/orders";
 import type {
+  HistoryDuplicateReference,
   ImportSessionPayload,
   OrderDraftRow,
   RawWorkbookContext,
@@ -217,6 +218,13 @@ function chooseBestSheet(sheets: WorkbookSheetSnapshot[]) {
   })[0] ?? null;
 }
 
+function buildExistingCodeIndex(details: HistoryDuplicateReference[]) {
+  return {
+    set: new Set(details.map((item) => item.externalCode)),
+    details: new Map(details.map((item) => [item.externalCode, item.displayLabel])),
+  };
+}
+
 export async function parseImportWorkbook(fileName: string, buffer: ArrayBuffer) {
   let workbook: XLSX.WorkBook;
 
@@ -262,7 +270,8 @@ export async function parseImportWorkbook(fileName: string, buffer: ArrayBuffer)
   }));
 
   const existingCodes = await listExistingExternalCodes();
-  const validation = validateOrderRows(draftRows, existingCodes.set);
+  const existingCodeIndex = buildExistingCodeIndex(existingCodes.details);
+  const validation = validateOrderRows(draftRows, existingCodeIndex);
 
   const payload: ImportSessionPayload = {
     fileName,
@@ -277,6 +286,7 @@ export async function parseImportWorkbook(fileName: string, buffer: ArrayBuffer)
     templateRuleMatch: templateRule.match,
     supportedSheets: snapshots,
     existingExternalCodes: existingCodes.list,
+    existingExternalCodeDetails: existingCodes.details,
     workbookContext: {
       sheets: snapshots.map((sheet) => ({
         sheetName: sheet.sheetName,
@@ -323,7 +333,8 @@ export async function parseImportContext(fileName: string, workbookContext: RawW
   }));
 
   const existingCodes = await listExistingExternalCodes();
-  const validation = validateOrderRows(draftRows, existingCodes.set);
+  const existingCodeIndex = buildExistingCodeIndex(existingCodes.details);
+  const validation = validateOrderRows(draftRows, existingCodeIndex);
 
   return {
     fileName,
@@ -338,6 +349,7 @@ export async function parseImportContext(fileName: string, workbookContext: RawW
     templateRuleMatch: templateRule.match,
     supportedSheets: snapshots,
     existingExternalCodes: existingCodes.list,
+    existingExternalCodeDetails: existingCodes.details,
     workbookContext: {
       sheets: snapshots.map((sheet) => ({
         sheetName: sheet.sheetName,
@@ -367,7 +379,7 @@ export async function rebuildRowsWithMapping(params: {
     params.mapping,
   );
   const existingCodes = await listExistingExternalCodes();
-  return validateOrderRows(draftRows, existingCodes.set);
+  return validateOrderRows(draftRows, buildExistingCodeIndex(existingCodes.details));
 }
 
 export function deserializeWorkbookFromJson(jsonText: string) {

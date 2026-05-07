@@ -239,12 +239,14 @@ function parseWorkbookInWorker(
   });
 }
 
-function buildExistingCodeSet(session: ImportSessionPayload | null) {
-  return new Set(
-    (session?.existingExternalCodes ?? [])
-      .map((value) => normalizeCode(value))
-      .filter((value) => value.length > 0),
-  );
+function buildExistingCodeIndex(session: ImportSessionPayload | null) {
+  const details = session?.existingExternalCodeDetails ?? [];
+  const set = new Set(details.map((item) => normalizeCode(item.externalCode)).filter((value) => value.length > 0));
+
+  return {
+    set,
+    details: new Map(details.map((item) => [normalizeCode(item.externalCode), item.displayLabel])),
+  };
 }
 
 function getAdjacentEditableCell(
@@ -320,7 +322,7 @@ export function UniversalImportApp() {
       };
     }
 
-    const validation = validateOrderRows(rows, buildExistingCodeSet(session));
+    const validation = validateOrderRows(rows, buildExistingCodeIndex(session));
     return {
       invalidCount: validation.invalidCount,
       validCount: validation.validCount,
@@ -458,7 +460,7 @@ export function UniversalImportApp() {
   function commitValidationAfterEdit() {
     const nextCell = pendingNavigationRef.current;
     pendingNavigationRef.current = null;
-    setRows((current) => validateOrderRows(current, buildExistingCodeSet(session)).rows);
+    setRows((current) => validateOrderRows(current, buildExistingCodeIndex(session)).rows);
     setEditingCell(nextCell);
   }
 
