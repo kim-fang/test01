@@ -29,6 +29,13 @@ export type ImportProgress = {
   stage: string;
 };
 
+export type TemplateRuleMatchMode = "exact" | "similar" | "none";
+
+export type TemplateRuleMatchInfo = {
+  mode: TemplateRuleMatchMode;
+  score: number;
+};
+
 export type RawWorkbookContext = {
   sheets: Array<{
     sheetName: string;
@@ -48,6 +55,7 @@ export type ImportSessionPayload = {
   savedRule: SavedTemplateRule | null;
   supportedSheets: WorkbookSheetSnapshot[];
   existingExternalCodes: string[];
+  templateRuleMatch: TemplateRuleMatchInfo;
   workbookContext: {
     sheets: Array<{
       sheetName: string;

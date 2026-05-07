@@ -11,9 +11,8 @@ import {
   validateOrderRows,
 } from "@/lib/order";
 import {
-  findTemplateRuleByFingerprint,
-  findTemplateRuleByHeaderSimilarity,
   listExistingExternalCodes,
+  resolveTemplateRule,
   saveTemplateRule,
 } from "@/lib/orders";
 import type {
@@ -249,7 +248,8 @@ export async function parseImportWorkbook(fileName: string, buffer: ArrayBuffer)
     throw new Error("未找到可导入的数据 Sheet。");
   }
 
-  const savedRule = (await findTemplateRuleByFingerprint(selectedSheet.fingerprint)) ?? (await findTemplateRuleByHeaderSimilarity(selectedSheet.headers));
+  const templateRule = await resolveTemplateRule(selectedSheet.headers, selectedSheet.fingerprint);
+  const savedRule = templateRule.rule;
   const effectiveMapping = savedRule ? remapSavedRuleToHeaders(savedRule, selectedSheet.headers) : selectedSheet.mapping;
   const draftRows = rowsFromMatrix(
     selectedSheet.rows.map((row) => row.map((cell) => cellToText(cell))),
@@ -274,6 +274,7 @@ export async function parseImportWorkbook(fileName: string, buffer: ArrayBuffer)
     mapping: effectiveMapping,
     suggestedMapping: selectedSheet.mapping,
     savedRule,
+    templateRuleMatch: templateRule.match,
     supportedSheets: snapshots,
     existingExternalCodes: existingCodes.list,
     workbookContext: {
@@ -308,7 +309,8 @@ export async function parseImportContext(fileName: string, workbookContext: RawW
     throw new Error("未找到可导入的数据 Sheet。");
   }
 
-  const savedRule = (await findTemplateRuleByFingerprint(selectedSheet.fingerprint)) ?? (await findTemplateRuleByHeaderSimilarity(selectedSheet.headers));
+  const templateRule = await resolveTemplateRule(selectedSheet.headers, selectedSheet.fingerprint);
+  const savedRule = templateRule.rule;
   const effectiveMapping = savedRule ? remapSavedRuleToHeaders(savedRule, selectedSheet.headers) : selectedSheet.mapping;
   const draftRows = rowsFromMatrix(
     selectedSheet.rows,
@@ -333,6 +335,7 @@ export async function parseImportContext(fileName: string, workbookContext: RawW
     mapping: effectiveMapping,
     suggestedMapping: selectedSheet.mapping,
     savedRule,
+    templateRuleMatch: templateRule.match,
     supportedSheets: snapshots,
     existingExternalCodes: existingCodes.list,
     workbookContext: {

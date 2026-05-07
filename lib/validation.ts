@@ -59,6 +59,11 @@ export const savedTemplateRuleSchema = z.object({
   updatedAt: z.string().min(1),
 });
 
+export const templateRuleMatchSchema = z.object({
+  mode: z.enum(["exact", "similar", "none"]),
+  score: z.number().min(0).max(1),
+});
+
 export const importSessionPayloadSchema = z.object({
   fileName: z.string().min(1),
   selectedSheetName: z.string().min(1),
@@ -71,6 +76,7 @@ export const importSessionPayloadSchema = z.object({
   savedRule: savedTemplateRuleSchema.nullable(),
   supportedSheets: z.array(workbookSheetSnapshotSchema),
   existingExternalCodes: z.array(z.string()),
+  templateRuleMatch: templateRuleMatchSchema,
   workbookContext: z.object({
     sheets: z.array(
       z.object({

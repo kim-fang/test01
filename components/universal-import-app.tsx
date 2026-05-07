@@ -416,9 +416,11 @@ export function UniversalImportApp() {
       setMappingDraft(normalizeMapping(payload.data.mapping));
       setImportProgress(createProgress("完成", payload.data.rows.length, payload.data.rows.length || 1));
       setNotice(
-        payload.data.savedRule
-          ? `已自动应用记忆模板规则，识别到 ${payload.data.rows.length} 条数据。`
-          : `已识别模板并导入 ${payload.data.rows.length} 条数据。`,
+        payload.data.templateRuleMatch.mode === "exact"
+          ? `已精确命中记忆模板，识别到 ${payload.data.rows.length} 条数据。`
+          : payload.data.templateRuleMatch.mode === "similar"
+            ? `已相似命中记忆模板，识别到 ${payload.data.rows.length} 条数据。`
+            : `已识别模板并导入 ${payload.data.rows.length} 条数据。`,
       );
     } catch (importError) {
       setError(importError instanceof Error ? importError.message : "导入失败。");
@@ -875,7 +877,14 @@ export function UniversalImportApp() {
               </div>
               <div className="summary-card">
                 <span>记忆模板</span>
-                <strong>{session.savedRule ? "已命中" : "首次学习"}</strong>
+                <strong>
+                  {session.templateRuleMatch.mode === "exact"
+                    ? "精确命中"
+                    : session.templateRuleMatch.mode === "similar"
+                      ? "相似命中"
+                      : "首次学习"}
+                </strong>
+                <span>置信度 {Math.round(session.templateRuleMatch.score * 100)}%</span>
               </div>
               <div className="summary-card">
                 <span>错误提示</span>

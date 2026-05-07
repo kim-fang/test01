@@ -1,11 +1,12 @@
 import { getSql } from "@/lib/db";
-import { normalizeHeader } from "@/lib/order";
+import { buildAutoMapping, normalizeHeader, orderFieldKeys } from "@/lib/order";
 import type {
   HistoryListPayload,
   OrderDraftRow,
   OrderHistoryItem,
   SavedTemplateRule,
   SubmitResult,
+  TemplateRuleMatchInfo,
   TemplateMapping,
 } from "@/lib/types";
 
@@ -50,29 +51,40 @@ function mapTemplateRule(row: TemplateRuleRow): SavedTemplateRule {
 }
 
 function ruleSimilarity(rule: SavedTemplateRule, headers: string[]) {
-  const current = new Set(headers.map((header) => normalizeHeader(header)).filter(Boolean));
-  const source = rule.headers.map((header) => normalizeHeader(header)).filter(Boolean);
+  const currentHeaders = headers.map((header) => normalizeHeader(header)).filter(Boolean);
+  const sourceHeaders = rule.headers.map((header) => normalizeHeader(header)).filter(Boolean);
 
-  if (!source.length || !current.size) {
+  if (!sourceHeaders.length || !currentHeaders.length) {
     return 0;
   }
 
-  let matches = 0;
-  for (const header of source) {
-    if (current.has(header)) {
-      matches += 1;
+  const currentHeaderSet = new Set(currentHeaders);
+  const sourceHeaderSet = new Set(sourceHeaders);
+  const exactHeaderOverlap = [...sourceHeaderSet].filter((header) => currentHeaderSet.has(header)).length;
+  const sourceMappingFields = orderFieldKeys.filter((field) => rule.mapping[field] !== null);
+  const currentMapping = buildAutoMapping(headers);
+  const fieldOverlap = sourceMappingFields.filter((field) => currentMapping[field] !== null).length;
+
+  let fuzzyHeaderOverlap = 0;
+  for (const header of sourceHeaders) {
+    if (currentHeaderSet.has(header)) {
+      fuzzyHeaderOverlap += 1;
       continue;
     }
 
-    for (const currentHeader of current) {
+    for (const currentHeader of currentHeaders) {
       if (currentHeader.includes(header) || header.includes(currentHeader)) {
-        matches += 0.7;
+        fuzzyHeaderOverlap += 0.7;
         break;
       }
     }
   }
 
-  return matches / Math.max(source.length, current.size);
+  const headerScore = fuzzyHeaderOverlap / Math.max(sourceHeaders.length, currentHeaders.length);
+  const fieldScore = sourceMappingFields.length > 0 ? fieldOverlap / sourceMappingFields.length : 0;
+  const exactBonus = exactHeaderOverlap > 0 ? exactHeaderOverlap / sourceHeaders.length : 0;
+
+  return Math.min(1, fieldScore * 0.6 + headerScore * 0.3 + exactBonus * 0.1);
 }
 
 function mapShippingOrder(row: ShippingOrderRow): OrderHistoryItem {
@@ -129,7 +141,44 @@ export async function findTemplateRuleByHeaderSimilarity(headers: string[]) {
     return null;
   }
 
-  return bestRule.rule;
+  return bestRule;
+}
+
+export async function resolveTemplateRule(headers: string[], fingerprint: string): Promise<{
+  rule: SavedTemplateRule | null;
+  match: TemplateRuleMatchInfo;
+}> {
+  const exactRule = await findTemplateRuleByFingerprint(fingerprint);
+
+  if (exactRule) {
+    return {
+      rule: exactRule,
+      match: {
+        mode: "exact",
+        score: 1,
+      },
+    };
+  }
+
+  const similar = await findTemplateRuleByHeaderSimilarity(headers);
+
+  if (similar) {
+    return {
+      rule: similar.rule,
+      match: {
+        mode: "similar",
+        score: similar.score,
+      },
+    };
+  }
+
+  return {
+    rule: null,
+    match: {
+      mode: "none",
+      score: 0,
+    },
+  };
 }
 
 export async function saveTemplateRule(rule: SavedTemplateRule) {
