@@ -87,6 +87,20 @@ export const importSessionPayloadSchema = z.object({
   validCount: z.number().int().nonnegative(),
 });
 
+export const rawWorkbookContextSchema = z.object({
+  sheets: z.array(
+    z.object({
+      sheetName: z.string().min(1),
+      rows: z.array(z.array(z.string())),
+    }),
+  ),
+});
+
+export const parseImportPayloadSchema = z.object({
+  fileName: z.string().min(1),
+  workbookContext: rawWorkbookContextSchema,
+});
+
 export const templateLearnPayloadSchema = z.object({
   fingerprint: z.string().min(1),
   sheetName: z.string().min(1),

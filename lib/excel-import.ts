@@ -5,12 +5,25 @@ import {
   countMappedRequiredFields,
   createEmptyOrderValues,
   fingerprintHeaders,
+  normalizeHeader,
   orderColumns,
   orderFieldKeys,
   validateOrderRows,
 } from "@/lib/order";
-import { findTemplateRuleByFingerprint, listExistingExternalCodes, saveTemplateRule } from "@/lib/orders";
-import type { ImportSessionPayload, OrderDraftRow, SavedTemplateRule, TemplateMapping, WorkbookSheetSnapshot } from "@/lib/types";
+import {
+  findTemplateRuleByFingerprint,
+  findTemplateRuleByHeaderSimilarity,
+  listExistingExternalCodes,
+  saveTemplateRule,
+} from "@/lib/orders";
+import type {
+  ImportSessionPayload,
+  OrderDraftRow,
+  RawWorkbookContext,
+  SavedTemplateRule,
+  TemplateMapping,
+  WorkbookSheetSnapshot,
+} from "@/lib/types";
 
 function cellToText(value: unknown) {
   if (value === undefined || value === null) {
@@ -24,31 +37,30 @@ function cellToText(value: unknown) {
   return `${value}`.trim();
 }
 
-function pickHeaderRow(matrix: string[][]) {
-  let bestIndex = -1;
-  let bestHeaders: string[] = [];
-  let bestMapping: TemplateMapping | null = null;
-  let bestScore = -1;
+function buildSheetSnapshotFromMatrix(sheetName: string, matrix: string[][]): WorkbookSheetSnapshot | null {
+  if (matrix.length === 0) {
+    return null;
+  }
 
-  matrix.forEach((row, index) => {
-    const headers = row.map((cell) => cellToText(cell)).filter((cell, cellIndex) => cellIndex < 30);
-    const mapping = buildAutoMapping(headers);
-    const score = countMappedRequiredFields(mapping) * 10 + countMappedFields(mapping);
+  const candidate = pickHeaderRow(matrix.slice(0, Math.min(matrix.length, 8)));
 
-    if (score > bestScore) {
-      bestIndex = index;
-      bestHeaders = headers;
-      bestMapping = mapping;
-      bestScore = score;
-    }
-  });
+  if (candidate.headerRowIndex < 0 || candidate.requiredMatches < 4) {
+    return null;
+  }
+
+  const headers = candidate.headers;
+  const rows = matrix.slice(candidate.headerRowIndex + 1).filter((row) =>
+    row.some((cell) => cellToText(cell).trim().length > 0),
+  );
 
   return {
-    headerRowIndex: bestIndex,
-    headers: bestHeaders,
-    mapping: bestMapping ?? buildAutoMapping([]),
-    requiredMatches: bestMapping ? countMappedRequiredFields(bestMapping) : 0,
-    totalMatches: bestMapping ? countMappedFields(bestMapping) : 0,
+    sheetName,
+    headers,
+    headerRowIndex: candidate.headerRowIndex,
+    fingerprint: fingerprintHeaders(headers),
+    mapping: candidate.mapping,
+    confidence: Math.min(1, candidate.requiredMatches / orderColumns.filter((column) => column.required).length),
+    rows,
   };
 }
 
@@ -100,6 +112,34 @@ function normalizeMatrix(worksheet: XLSX.WorkSheet) {
     .map((row) => row.map((cell) => cellToText(cell)));
 }
 
+function pickHeaderRow(matrix: string[][]) {
+  let bestIndex = -1;
+  let bestHeaders: string[] = [];
+  let bestMapping: TemplateMapping | null = null;
+  let bestScore = -1;
+
+  matrix.forEach((row, index) => {
+    const headers = row.map((cell) => cellToText(cell)).filter((cell, cellIndex) => cellIndex < 30);
+    const mapping = buildAutoMapping(headers);
+    const score = countMappedRequiredFields(mapping) * 10 + countMappedFields(mapping);
+
+    if (score > bestScore) {
+      bestIndex = index;
+      bestHeaders = headers;
+      bestMapping = mapping;
+      bestScore = score;
+    }
+  });
+
+  return {
+    headerRowIndex: bestIndex,
+    headers: bestHeaders,
+    mapping: bestMapping ?? buildAutoMapping([]),
+    requiredMatches: bestMapping ? countMappedRequiredFields(bestMapping) : 0,
+    totalMatches: bestMapping ? countMappedFields(bestMapping) : 0,
+  };
+}
+
 function buildSheetSnapshot(sheetName: string, worksheet: XLSX.WorkSheet): WorkbookSheetSnapshot | null {
   const matrix = normalizeMatrix(worksheet);
 
@@ -113,20 +153,55 @@ function buildSheetSnapshot(sheetName: string, worksheet: XLSX.WorkSheet): Workb
     return null;
   }
 
-  const headers = candidate.headers;
-  const rows = matrix.slice(candidate.headerRowIndex + 1).filter((row) =>
-    row.some((cell) => cellToText(cell).trim().length > 0),
-  );
+  return buildSheetSnapshotFromMatrix(sheetName, matrix);
+}
 
-  return {
-    sheetName,
-    headers,
-    headerRowIndex: candidate.headerRowIndex,
-    fingerprint: fingerprintHeaders(headers),
-    mapping: candidate.mapping,
-    confidence: Math.min(1, candidate.requiredMatches / orderColumns.filter((column) => column.required).length),
-    rows,
-  };
+function remapSavedRuleToHeaders(rule: SavedTemplateRule, headers: string[]) {
+  const mapping = Object.fromEntries(orderFieldKeys.map((field) => [field, null])) as TemplateMapping;
+  const normalizedHeaders = headers.map((header) => normalizeHeader(header));
+  const usedIndices = new Set<number>();
+
+  for (const field of orderFieldKeys) {
+    const sourceIndex = rule.mapping[field];
+    if (sourceIndex === null || sourceIndex === undefined) {
+      continue;
+    }
+
+    const sourceHeader = rule.headers[sourceIndex] ?? "";
+    const normalizedSource = normalizeHeader(sourceHeader);
+
+    let bestIndex = -1;
+    let bestScore = 0;
+
+    normalizedHeaders.forEach((header, index) => {
+      if (usedIndices.has(index)) {
+        return;
+      }
+
+      let score = 0;
+      if (!header || !normalizedSource) {
+        score = 0;
+      } else if (header === normalizedSource) {
+        score = 100;
+      } else if (header.includes(normalizedSource) || normalizedSource.includes(header)) {
+        score = 70;
+      } else if (header.startsWith(normalizedSource) || normalizedSource.startsWith(header)) {
+        score = 55;
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = index;
+      }
+    });
+
+    if (bestIndex >= 0 && bestScore >= 55) {
+      mapping[field] = bestIndex;
+      usedIndices.add(bestIndex);
+    }
+  }
+
+  return mapping;
 }
 
 function chooseBestSheet(sheets: WorkbookSheetSnapshot[]) {
@@ -174,8 +249,8 @@ export async function parseImportWorkbook(fileName: string, buffer: ArrayBuffer)
     throw new Error("未找到可导入的数据 Sheet。");
   }
 
-  const savedRule = await findTemplateRuleByFingerprint(selectedSheet.fingerprint);
-  const effectiveMapping = savedRule?.mapping ?? selectedSheet.mapping;
+  const savedRule = (await findTemplateRuleByFingerprint(selectedSheet.fingerprint)) ?? (await findTemplateRuleByHeaderSimilarity(selectedSheet.headers));
+  const effectiveMapping = savedRule ? remapSavedRuleToHeaders(savedRule, selectedSheet.headers) : selectedSheet.mapping;
   const draftRows = rowsFromMatrix(
     selectedSheet.rows.map((row) => row.map((cell) => cellToText(cell))),
     selectedSheet.sheetName,
@@ -216,6 +291,63 @@ export async function parseImportWorkbook(fileName: string, buffer: ArrayBuffer)
   };
 
   return payload;
+}
+
+export async function parseImportContext(fileName: string, workbookContext: RawWorkbookContext) {
+  const snapshots = workbookContext.sheets
+    .map((sheet) => buildSheetSnapshotFromMatrix(sheet.sheetName, sheet.rows))
+    .filter((sheet): sheet is WorkbookSheetSnapshot => Boolean(sheet));
+
+  if (!snapshots.length) {
+    throw new Error("未识别到有效表头，请检查模板内容或手动选择列映射。");
+  }
+
+  const selectedSheet = chooseBestSheet(snapshots);
+
+  if (!selectedSheet) {
+    throw new Error("未找到可导入的数据 Sheet。");
+  }
+
+  const savedRule = (await findTemplateRuleByFingerprint(selectedSheet.fingerprint)) ?? (await findTemplateRuleByHeaderSimilarity(selectedSheet.headers));
+  const effectiveMapping = savedRule ? remapSavedRuleToHeaders(savedRule, selectedSheet.headers) : selectedSheet.mapping;
+  const draftRows = rowsFromMatrix(
+    selectedSheet.rows,
+    selectedSheet.sheetName,
+    -1,
+    effectiveMapping,
+  ).map((row, index) => ({
+    ...row,
+    rowNumber: selectedSheet.headerRowIndex + index + 2,
+  }));
+
+  const existingCodes = await listExistingExternalCodes();
+  const validation = validateOrderRows(draftRows, existingCodes.set);
+
+  return {
+    fileName,
+    selectedSheetName: selectedSheet.sheetName,
+    fingerprint: selectedSheet.fingerprint,
+    headers: selectedSheet.headers,
+    headerRowIndex: selectedSheet.headerRowIndex,
+    rows: validation.rows,
+    mapping: effectiveMapping,
+    suggestedMapping: selectedSheet.mapping,
+    savedRule,
+    supportedSheets: snapshots,
+    existingExternalCodes: existingCodes.list,
+    workbookContext: {
+      sheets: snapshots.map((sheet) => ({
+        sheetName: sheet.sheetName,
+        headers: sheet.headers,
+        headerRowIndex: sheet.headerRowIndex,
+        fingerprint: sheet.fingerprint,
+        rows: sheet.rows,
+      })),
+    },
+    validationMessages: validation.messages,
+    invalidCount: validation.invalidCount,
+    validCount: validation.validCount,
+  } satisfies ImportSessionPayload;
 }
 
 export async function rebuildRowsWithMapping(params: {

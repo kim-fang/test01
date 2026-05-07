@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { parseImportWorkbook } from "@/lib/excel-import";
+import { parseImportContext, parseImportWorkbook } from "@/lib/excel-import";
+import { parseImportPayloadSchema } from "@/lib/validation";
 
 export const runtime = "nodejs";
 
@@ -14,6 +15,14 @@ function handleError(error: unknown) {
 
 export async function POST(request: Request) {
   try {
+    const contentType = request.headers.get("content-type") ?? "";
+
+    if (contentType.includes("application/json")) {
+      const payload = parseImportPayloadSchema.parse(await request.json());
+      const data = await parseImportContext(payload.fileName, payload.workbookContext);
+      return NextResponse.json({ data });
+    }
+
     const formData = await request.formData();
     const file = formData.get("file");
 

@@ -29,6 +29,13 @@ export type ImportProgress = {
   stage: string;
 };
 
+export type RawWorkbookContext = {
+  sheets: Array<{
+    sheetName: string;
+    rows: string[][];
+  }>;
+};
+
 export type ImportSessionPayload = {
   fileName: string;
   selectedSheetName: string;
@@ -53,6 +60,11 @@ export type ImportSessionPayload = {
   validationMessages: string[];
   invalidCount: number;
   validCount: number;
+};
+
+export type ParseImportPayload = {
+  fileName: string;
+  workbookContext: RawWorkbookContext;
 };
 
 export type SubmitResult = {

@@ -1,4 +1,5 @@
 import { getSql } from "@/lib/db";
+import { normalizeHeader } from "@/lib/order";
 import type {
   HistoryListPayload,
   OrderDraftRow,
@@ -48,6 +49,32 @@ function mapTemplateRule(row: TemplateRuleRow): SavedTemplateRule {
   };
 }
 
+function ruleSimilarity(rule: SavedTemplateRule, headers: string[]) {
+  const current = new Set(headers.map((header) => normalizeHeader(header)).filter(Boolean));
+  const source = rule.headers.map((header) => normalizeHeader(header)).filter(Boolean);
+
+  if (!source.length || !current.size) {
+    return 0;
+  }
+
+  let matches = 0;
+  for (const header of source) {
+    if (current.has(header)) {
+      matches += 1;
+      continue;
+    }
+
+    for (const currentHeader of current) {
+      if (currentHeader.includes(header) || header.includes(currentHeader)) {
+        matches += 0.7;
+        break;
+      }
+    }
+  }
+
+  return matches / Math.max(source.length, current.size);
+}
+
 function mapShippingOrder(row: ShippingOrderRow): OrderHistoryItem {
   return {
     id: row.id,
@@ -80,6 +107,29 @@ export async function findTemplateRuleByFingerprint(fingerprint: string) {
   `) as TemplateRuleRow[];
 
   return rows[0] ? mapTemplateRule(rows[0]) : null;
+}
+
+export async function findTemplateRuleByHeaderSimilarity(headers: string[]) {
+  const sql = getSql();
+  const rows = (await sql`
+    SELECT fingerprint, sheet_name, header_row_index, headers, mapping, updated_at
+    FROM template_rules;
+  `) as TemplateRuleRow[];
+
+  if (!rows.length) {
+    return null;
+  }
+
+  const rules = rows.map(mapTemplateRule);
+  const bestRule = rules
+    .map((rule) => ({ rule, score: ruleSimilarity(rule, headers) }))
+    .sort((left, right) => right.score - left.score)[0];
+
+  if (!bestRule || bestRule.score < 0.55) {
+    return null;
+  }
+
+  return bestRule.rule;
 }
 
 export async function saveTemplateRule(rule: SavedTemplateRule) {

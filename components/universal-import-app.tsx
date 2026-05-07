@@ -17,6 +17,7 @@ import type {
   OrderDraftRow,
   OrderFieldKey,
   OrderHistoryItem,
+  ParseImportPayload,
   TemplateMapping,
 } from "@/lib/types";
 
@@ -46,6 +47,26 @@ type SaveFilePickerWindow = Window & {
     }>;
   }>;
 };
+
+type ImportWorkerProgressMessage = {
+  type: "progress";
+  payload: ImportProgress;
+};
+
+type ImportWorkerResultMessage = {
+  type: "result";
+  payload: ParseImportPayload;
+};
+
+type ImportWorkerErrorMessage = {
+  type: "error";
+  payload: string;
+};
+
+type ImportWorkerMessage =
+  | ImportWorkerProgressMessage
+  | ImportWorkerResultMessage
+  | ImportWorkerErrorMessage;
 
 const emptyFilters: HistoryFilters = {
   externalCode: "",
@@ -146,6 +167,76 @@ function getErrorText(row: OrderDraftRow, field: OrderFieldKey) {
 
 function normalizeMapping(mapping: TemplateMapping) {
   return Object.fromEntries(orderFieldKeys.map((field) => [field, mapping[field] ?? null])) as TemplateMapping;
+}
+
+function readFileAsArrayBuffer(
+  file: File,
+  onProgress: (progress: ImportProgress) => void,
+) {
+  return new Promise<ArrayBuffer>((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onprogress = (event) => {
+      onProgress(createProgress("读取本地文件", event.loaded, event.total || file.size || 1));
+    };
+
+    reader.onerror = () => {
+      reject(new Error("读取本地文件失败。"));
+    };
+
+    reader.onload = () => {
+      if (!(reader.result instanceof ArrayBuffer)) {
+        reject(new Error("读取文件结果异常。"));
+        return;
+      }
+
+      onProgress(createProgress("读取本地文件", file.size || 1, file.size || 1));
+      resolve(reader.result);
+    };
+
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+function parseWorkbookInWorker(
+  fileName: string,
+  buffer: ArrayBuffer,
+  onProgress: (progress: ImportProgress) => void,
+) {
+  return new Promise<ParseImportPayload>((resolve, reject) => {
+    const worker = new Worker(new URL("../workers/import-worker.ts", import.meta.url));
+
+    worker.onmessage = (event: MessageEvent<ImportWorkerMessage>) => {
+      const message = event.data;
+
+      if (message.type === "progress") {
+        onProgress(message.payload);
+        return;
+      }
+
+      worker.terminate();
+
+      if (message.type === "result") {
+        resolve(message.payload);
+        return;
+      }
+
+      reject(new Error(message.payload));
+    };
+
+    worker.onerror = () => {
+      worker.terminate();
+      reject(new Error("本地解析 Excel 失败。"));
+    };
+
+    worker.postMessage(
+      {
+        fileName,
+        buffer,
+      },
+      [buffer],
+    );
+  });
 }
 
 function buildExistingCodeSet(session: ImportSessionPayload | null) {
@@ -295,16 +386,25 @@ export function UniversalImportApp() {
     setMappingOpen(false);
 
     try {
-      const formData = new FormData();
-      formData.append("file", file);
+      const buffer = await readFileAsArrayBuffer(file, (progress) => {
+        setImportProgress(progress);
+      });
+      const parsedWorkbook = await parseWorkbookInWorker(file.name, buffer, (progress) => {
+        setImportProgress(progress);
+      });
+      const workbookRowCount = parsedWorkbook.workbookContext.sheets.reduce(
+        (sum, sheet) => sum + sheet.rows.length,
+        0,
+      );
+      setImportProgress(createProgress("套用模板规则并校验数据", 0, Math.max(workbookRowCount, 1)));
 
-      setImportProgress(createProgress("上传文件", 15, 100));
       const response = await fetch("/api/import/parse", {
         method: "POST",
-        body: formData,
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(parsedWorkbook),
       });
-
-      setImportProgress(createProgress("解析模板与映射字段", 70, 100));
       const payload = await readJson<ApiSuccess<ImportSessionPayload>>(response);
 
       if (!response.ok || !payload.data) {
@@ -500,45 +600,67 @@ export function UniversalImportApp() {
     setSubmitProgress(createProgress("准备提交", 0, rows.length));
 
     try {
-      setSubmitProgress(createProgress("上传运单数据", Math.max(1, Math.floor(rows.length * 0.3)), rows.length));
-      const response = await fetch("/api/orders", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          rows,
-          sourceTemplateName: session.fileName,
-          sourceSheetName: session.selectedSheetName,
-          sourceFingerprint: session.fingerprint,
-        }),
-      });
-      const payload = await readJson<
-        ApiSuccess<{
-          successCount: number;
-          failureCount: number;
-          failures: Array<{ rowNumber: number; reason: string }>;
-        }>
-      >(response);
+      const chunkSize = 100;
+      let processedCount = 0;
+      let successCount = 0;
+      let failureCount = 0;
+      const failures: Array<{ rowNumber: number; reason: string }> = [];
 
-      if (!response.ok || !payload.data) {
-        throw new Error(payload.error ?? "提交下单失败。");
+      for (let startIndex = 0; startIndex < rows.length; startIndex += chunkSize) {
+        const chunkRows = rows.slice(startIndex, startIndex + chunkSize);
+        setSubmitProgress(createProgress("提交下单", processedCount, rows.length));
+
+        const response = await fetch("/api/orders", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            rows: chunkRows,
+            sourceTemplateName: session.fileName,
+            sourceSheetName: session.selectedSheetName,
+            sourceFingerprint: session.fingerprint,
+          }),
+        });
+        const payload = await readJson<
+          ApiSuccess<{
+            successCount: number;
+            failureCount: number;
+            failures: Array<{ rowNumber: number; reason: string }>;
+          }>
+        >(response);
+
+        if (!response.ok || !payload.data) {
+          throw new Error(payload.error ?? "提交下单失败。");
+        }
+
+        successCount += payload.data.successCount;
+        failureCount += payload.data.failureCount;
+        failures.push(...payload.data.failures);
+        processedCount += chunkRows.length;
+        setSubmitProgress(createProgress("提交下单", processedCount, rows.length));
       }
 
       setSubmitProgress(createProgress("完成", rows.length, rows.length));
       setNotice(
-        payload.data.failureCount > 0
-          ? `提交完成，成功 ${payload.data.successCount} 条，失败 ${payload.data.failureCount} 条。失败详情：${payload.data.failures
+        failureCount > 0
+          ? `提交完成，成功 ${successCount} 条，失败 ${failureCount} 条。失败详情：${failures
               .slice(0, 3)
               .map((item) => `第 ${item.rowNumber} 行 ${item.reason}`)
               .join("；")}`
-          : `提交完成，成功 ${payload.data.successCount} 条，失败 ${payload.data.failureCount} 条。`,
+          : `提交完成，成功 ${successCount} 条，失败 ${failureCount} 条。`,
       );
-      setRows([]);
-      setSession(null);
-      setMappingDraft(null);
-      pendingNavigationRef.current = null;
-      setEditingCell(null);
+
+      if (failureCount > 0) {
+        const failedRowNumbers = new Set(failures.map((item) => item.rowNumber));
+        setRows((current) => current.filter((row) => failedRowNumbers.has(row.rowNumber)));
+      } else {
+        setRows([]);
+        setSession(null);
+        setMappingDraft(null);
+        pendingNavigationRef.current = null;
+        setEditingCell(null);
+      }
 
       await loadHistory(1, historyFilters);
     } catch (submitError) {
