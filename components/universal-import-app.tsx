@@ -148,8 +148,50 @@ function normalizeMapping(mapping: TemplateMapping) {
   return Object.fromEntries(orderFieldKeys.map((field) => [field, mapping[field] ?? null])) as TemplateMapping;
 }
 
+function buildExistingCodeSet(session: ImportSessionPayload | null) {
+  return new Set(
+    (session?.existingExternalCodes ?? [])
+      .map((value) => normalizeCode(value))
+      .filter((value) => value.length > 0),
+  );
+}
+
+function getAdjacentEditableCell(
+  rows: OrderDraftRow[],
+  rowId: string,
+  field: OrderFieldKey,
+  direction: 1 | -1,
+) {
+  const rowIndex = rows.findIndex((item) => item.id === rowId);
+  const fieldIndex = orderFieldKeys.indexOf(field);
+
+  if (rowIndex < 0 || fieldIndex < 0) {
+    return null;
+  }
+
+  const flatIndex = rowIndex * orderFieldKeys.length + fieldIndex + direction;
+
+  if (flatIndex < 0 || flatIndex >= rows.length * orderFieldKeys.length) {
+    return null;
+  }
+
+  const nextRowIndex = Math.floor(flatIndex / orderFieldKeys.length);
+  const nextFieldIndex = flatIndex % orderFieldKeys.length;
+  const nextRow = rows[nextRowIndex];
+
+  if (!nextRow) {
+    return null;
+  }
+
+  return {
+    rowId: nextRow.id,
+    field: orderFieldKeys[nextFieldIndex],
+  };
+}
+
 export function UniversalImportApp() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const pendingNavigationRef = useRef<{ rowId: string; field: OrderFieldKey } | null>(null);
   const [dragging, setDragging] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -174,6 +216,9 @@ export function UniversalImportApp() {
   const [mappingDraft, setMappingDraft] = useState<TemplateMapping | null>(null);
 
   const historyPageSize = 10;
+  const selectedSheetSnapshot = session
+    ? session.supportedSheets.find((sheet) => sheet.sheetName === session.selectedSheetName) ?? null
+    : null;
 
   const validationSummary = useMemo(() => {
     if (!rows.length) {
@@ -184,17 +229,13 @@ export function UniversalImportApp() {
       };
     }
 
-    const existingCodes = new Set(
-      (session?.existingExternalCodes ?? []).map((value) => normalizeCode(value)).filter((value) => value.length > 0),
-    );
-
-    const validation = validateOrderRows(rows, existingCodes);
+    const validation = validateOrderRows(rows, buildExistingCodeSet(session));
     return {
       invalidCount: validation.invalidCount,
       validCount: validation.validCount,
       messages: validation.messages,
     };
-  }, [rows, session?.existingExternalCodes]);
+  }, [rows, session]);
 
   async function loadHistory(page = historyPage, filters = historyFilters) {
     setHistoryLoading(true);
@@ -246,8 +287,12 @@ export function UniversalImportApp() {
     clearFeedback();
     setImporting(true);
     setImportProgress(createProgress("准备解析文件", 0, 100));
+    setSubmitProgress(null);
     setSession(null);
     setRows([]);
+    setEditingCell(null);
+    pendingNavigationRef.current = null;
+    setMappingOpen(false);
 
     try {
       const formData = new FormData();
@@ -309,16 +354,10 @@ export function UniversalImportApp() {
   }
 
   function commitValidationAfterEdit() {
-    if (!rows.length) {
-      return;
-    }
-
-    const existingCodes = new Set(
-      (session?.existingExternalCodes ?? []).map((value) => normalizeCode(value)).filter((value) => value.length > 0),
-    );
-
-    const validation = validateOrderRows(rows, existingCodes);
-    setRows(validation.rows);
+    const nextCell = pendingNavigationRef.current;
+    pendingNavigationRef.current = null;
+    setRows((current) => validateOrderRows(current, buildExistingCodeSet(session)).rows);
+    setEditingCell(nextCell);
   }
 
   function handleDeleteRow(rowId: string) {
@@ -388,7 +427,7 @@ export function UniversalImportApp() {
       setRows(payload.data.rows);
       setImportProgress(createProgress("保存模板记忆", 80, 100));
 
-      await fetch("/api/template-rules", {
+      const saveResponse = await fetch("/api/template-rules", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -401,10 +440,14 @@ export function UniversalImportApp() {
           mapping: mappingDraft,
         }),
       });
+      if (!saveResponse.ok) {
+        const savePayload = (await readJson<ApiSuccess<unknown>>(saveResponse)) as ApiSuccess<unknown>;
+        throw new Error(savePayload.error ?? "模板记忆保存失败。");
+      }
 
       setNotice("已应用新映射并保存模板记忆，下次相同表头会自动匹配。");
       setMappingOpen(false);
-      setImportProgress(createProgress("完成", rows.length || 1, rows.length || 1));
+      setImportProgress(createProgress("完成", payload.data.rows.length || 1, payload.data.rows.length || 1));
     } catch (mapError) {
       setError(mapError instanceof Error ? mapError.message : "映射应用失败。");
     } finally {
@@ -484,11 +527,18 @@ export function UniversalImportApp() {
 
       setSubmitProgress(createProgress("完成", rows.length, rows.length));
       setNotice(
-        `提交完成，成功 ${payload.data.successCount} 条，失败 ${payload.data.failureCount} 条。`,
+        payload.data.failureCount > 0
+          ? `提交完成，成功 ${payload.data.successCount} 条，失败 ${payload.data.failureCount} 条。失败详情：${payload.data.failures
+              .slice(0, 3)
+              .map((item) => `第 ${item.rowNumber} 行 ${item.reason}`)
+              .join("；")}`
+          : `提交完成，成功 ${payload.data.successCount} 条，失败 ${payload.data.failureCount} 条。`,
       );
       setRows([]);
       setSession(null);
       setMappingDraft(null);
+      pendingNavigationRef.current = null;
+      setEditingCell(null);
 
       await loadHistory(1, historyFilters);
     } catch (submitError) {
@@ -499,6 +549,18 @@ export function UniversalImportApp() {
   }
 
   const historyTotalPages = Math.max(1, Math.ceil(historyTotal / historyPageSize));
+
+  function applyHistoryFilters(filters: HistoryFilters) {
+    clearFeedback();
+
+    if (filters.dateFrom && filters.dateTo && filters.dateFrom > filters.dateTo) {
+      setError("开始日期不能晚于结束日期。");
+      return;
+    }
+
+    setHistoryFilters(filters);
+    void loadHistory(1, filters);
+  }
 
   return (
     <main className="exam-shell">
@@ -610,6 +672,41 @@ export function UniversalImportApp() {
           </button>
         </section>
 
+        <section className="panel">
+          <div className="panel-header">
+            <div>
+              <span className="eyebrow">边界场景说明</span>
+              <h3>这几个细节我也处理了</h3>
+            </div>
+          </div>
+          <div className="edge-grid">
+            <div className="edge-card">
+              <strong>多 Sheet / 说明页</strong>
+              <p>会自动跳过说明页，优先识别含数据的 Sheet；如果表头不明显，也会向下扫描前几行。</p>
+            </div>
+            <div className="edge-card">
+              <strong>合并单元格 / 变列序</strong>
+              <p>允许标题行被合并、列顺序互换、列名中英文混用，自动识别失败时可手动映射。</p>
+            </div>
+            <div className="edge-card">
+              <strong>选填字段缺失</strong>
+              <p>外部编码、备注缺失不会阻断导入；空文件、坏文件、无有效 Sheet 会给出明确提示。</p>
+            </div>
+            <div className="edge-card">
+              <strong>重复编码双重校验</strong>
+              <p>会同时检查本批次重复和历史数据库重复，并明确提示与哪一行或历史数据冲突。</p>
+            </div>
+            <div className="edge-card">
+              <strong>大批量导入 / 导出</strong>
+              <p>1000 条以上数据也能预览、校验、导出当前修改结果，并在导入和提交时显示进度。</p>
+            </div>
+            <div className="edge-card">
+              <strong>记忆规则</strong>
+              <p>手动调过一次列映射后会保存，下次同结构模板会自动套用，减少重复配置。</p>
+            </div>
+          </div>
+        </section>
+
         {importProgress ? (
           <section className="panel">
             <div className="panel-header">
@@ -665,6 +762,37 @@ export function UniversalImportApp() {
               <div className="summary-card">
                 <span>可提交行</span>
                 <strong>{validationSummary.validCount}</strong>
+              </div>
+              <div className="summary-card">
+                <span>候选 Sheet</span>
+                <strong>{session.supportedSheets.length}</strong>
+              </div>
+              <div className="summary-card">
+                <span>识别置信度</span>
+                <strong>{Math.round((selectedSheetSnapshot?.confidence ?? 0) * 100)}%</strong>
+              </div>
+            </div>
+
+            <div className="sheet-overview">
+              <div className="sheet-overview-head">
+                <h4>候选 Sheet 识别概览</h4>
+                <p>如果文件里有说明页、封面页或多个工作表，这里会把所有可导入候选项列出来。</p>
+              </div>
+              <div className="sheet-grid">
+                {session.supportedSheets.map((sheet) => {
+                  const isSelected = sheet.sheetName === session.selectedSheetName;
+                  return (
+                    <div key={sheet.sheetName} className={`sheet-card${isSelected ? " active" : ""}`}>
+                      <div className="sheet-card-head">
+                        <strong>{sheet.sheetName}</strong>
+                        <span>{isSelected ? "当前采用" : "候选"}</span>
+                      </div>
+                      <p>表头：第 {sheet.headerRowIndex + 1} 行</p>
+                      <p>可导入数据：{sheet.rows.length} 条</p>
+                      <p>识别置信度：{Math.round(sheet.confidence * 100)}%</p>
+                    </div>
+                  );
+                })}
               </div>
             </div>
 
@@ -749,6 +877,11 @@ export function UniversalImportApp() {
             </div>
           </div>
 
+          <div className="interaction-note">
+            <strong>交互提示</strong>
+            <p>点击单元格即可编辑，Enter / Tab 会自动跳到下一格，Shift + Tab 返回上一格，离开单元格后会立即重新校验整行。</p>
+          </div>
+
           {submitProgress ? (
             <div className="mini-progress">
               <div className="progress-track">
@@ -796,6 +929,7 @@ export function UniversalImportApp() {
                           <td
                             key={`${row.id}-${column.key}`}
                             className={errorText ? "cell-error" : ""}
+                            title={errorText || "点击编辑"}
                             onClick={() => setEditingCell({ rowId: row.id, field: column.key })}
                           >
                             {isEditing ? (
@@ -804,10 +938,27 @@ export function UniversalImportApp() {
                                   autoFocus
                                   value={value}
                                   onBlur={() => {
-                                    setEditingCell(null);
                                     commitValidationAfterEdit();
                                   }}
                                   onChange={(event) => handleEditValue(row.id, column.key, event.target.value)}
+                                  onKeyDown={(event) => {
+                                    if (event.key === "Enter" || event.key === "Tab") {
+                                      event.preventDefault();
+                                      pendingNavigationRef.current = getAdjacentEditableCell(
+                                        rows,
+                                        row.id,
+                                        column.key,
+                                        event.shiftKey ? -1 : 1,
+                                      );
+                                      event.currentTarget.blur();
+                                    }
+
+                                    if (event.key === "Escape") {
+                                      event.preventDefault();
+                                      pendingNavigationRef.current = null;
+                                      event.currentTarget.blur();
+                                    }
+                                  }}
                                 >
                                   <option value="">请选择</option>
                                   {temperatureOptions.map((item) => (
@@ -822,13 +973,24 @@ export function UniversalImportApp() {
                                   value={value}
                                   onChange={(event) => handleEditValue(row.id, column.key, event.target.value)}
                                   onBlur={() => {
-                                    setEditingCell(null);
                                     commitValidationAfterEdit();
                                   }}
                                   onKeyDown={(event) => {
                                     if (event.key === "Enter" || event.key === "Tab") {
-                                      setEditingCell(null);
-                                      commitValidationAfterEdit();
+                                      event.preventDefault();
+                                      pendingNavigationRef.current = getAdjacentEditableCell(
+                                        rows,
+                                        row.id,
+                                        column.key,
+                                        event.shiftKey ? -1 : 1,
+                                      );
+                                      event.currentTarget.blur();
+                                    }
+
+                                    if (event.key === "Escape") {
+                                      event.preventDefault();
+                                      pendingNavigationRef.current = null;
+                                      event.currentTarget.blur();
                                     }
                                   }}
                                 />
@@ -939,8 +1101,7 @@ export function UniversalImportApp() {
               type="button"
               className="primary-action"
               onClick={() => {
-                setHistoryFilters(draftHistoryFilters);
-                void loadHistory(1, draftHistoryFilters);
+                applyHistoryFilters(draftHistoryFilters);
               }}
             >
               查询
@@ -950,8 +1111,7 @@ export function UniversalImportApp() {
               className="secondary-action"
               onClick={() => {
                 setDraftHistoryFilters(emptyFilters);
-                setHistoryFilters(emptyFilters);
-                void loadHistory(1, emptyFilters);
+                applyHistoryFilters(emptyFilters);
               }}
             >
               重置
