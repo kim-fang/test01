@@ -1,5 +1,10 @@
 import { getSql } from "@/lib/db";
-import { buildAutoMapping, normalizeHeader, orderFieldKeys } from "@/lib/order";
+import {
+  buildAutoMapping,
+  legacyFingerprintHeaders,
+  normalizeHeader,
+  orderFieldKeys,
+} from "@/lib/order";
 import type {
   HistoryListPayload,
   HistoryDuplicateReference,
@@ -122,6 +127,23 @@ export async function findTemplateRuleByFingerprint(fingerprint: string) {
   return rows[0] ? mapTemplateRule(rows[0]) : null;
 }
 
+export async function findTemplateRuleByAnyFingerprint(headers: string[], fingerprint: string) {
+  const exactRule = await findTemplateRuleByFingerprint(fingerprint);
+  if (exactRule) {
+    return exactRule;
+  }
+
+  const legacyFingerprint = legacyFingerprintHeaders(headers);
+  if (legacyFingerprint !== fingerprint) {
+    const legacyRule = await findTemplateRuleByFingerprint(legacyFingerprint);
+    if (legacyRule) {
+      return legacyRule;
+    }
+  }
+
+  return null;
+}
+
 export async function findTemplateRuleByHeaderSimilarity(headers: string[]) {
   const sql = getSql();
   const rows = (await sql`
@@ -138,7 +160,7 @@ export async function findTemplateRuleByHeaderSimilarity(headers: string[]) {
     .map((rule) => ({ rule, score: ruleSimilarity(rule, headers) }))
     .sort((left, right) => right.score - left.score)[0];
 
-  if (!bestRule || bestRule.score < 0.55) {
+  if (!bestRule || bestRule.score < 0.45) {
     return null;
   }
 
@@ -149,7 +171,7 @@ export async function resolveTemplateRule(headers: string[], fingerprint: string
   rule: SavedTemplateRule | null;
   match: TemplateRuleMatchInfo;
 }> {
-  const exactRule = await findTemplateRuleByFingerprint(fingerprint);
+  const exactRule = await findTemplateRuleByAnyFingerprint(headers, fingerprint);
 
   if (exactRule) {
     return {
@@ -388,4 +410,27 @@ export async function listHistory(params: {
   };
 
   return payload;
+}
+
+export async function deleteHistoryOrders(ids: string[]) {
+  const sql = getSql();
+  const normalizedIds = [...new Set(ids.map((id) => id.trim()).filter(Boolean))];
+
+  if (!normalizedIds.length) {
+    return {
+      deletedCount: 0,
+      deletedIds: [],
+    };
+  }
+
+  const rows = (await sql`
+    DELETE FROM shipping_orders
+    WHERE id = ANY(${normalizedIds}::uuid[])
+    RETURNING id;
+  `) as Array<{ id: string }>;
+
+  return {
+    deletedCount: rows.length,
+    deletedIds: rows.map((row) => row.id),
+  };
 }

@@ -37,30 +37,71 @@ function cellToText(value: unknown) {
   return `${value}`.trim();
 }
 
-function buildSheetSnapshotFromMatrix(sheetName: string, matrix: string[][]): WorkbookSheetSnapshot | null {
+function normalizeMatrix(worksheet: XLSX.WorkSheet) {
+  return XLSX.utils
+    .sheet_to_json<(string | number | null)[]>(worksheet, {
+      header: 1,
+      blankrows: false,
+      defval: "",
+      raw: false,
+    })
+    .map((row) => row.map((cell) => cellToText(cell)));
+}
+
+function pickHeaderRow(matrix: string[][]) {
+  let bestIndex = -1;
+  let bestHeaders: string[] = [];
+  let bestMapping: TemplateMapping | null = null;
+  let bestScore = -1;
+
+  matrix.forEach((row, index) => {
+    const headers = row.slice(0, 30).map((cell) => cellToText(cell));
+    const mapping = buildAutoMapping(headers);
+    const score = countMappedRequiredFields(mapping) * 10 + countMappedFields(mapping);
+
+    if (score > bestScore) {
+      bestIndex = index;
+      bestHeaders = headers;
+      bestMapping = mapping;
+      bestScore = score;
+    }
+  });
+
+  return {
+    headerRowIndex: bestIndex,
+    headers: bestHeaders,
+    mapping: bestMapping ?? buildAutoMapping([]),
+    requiredMatches: bestMapping ? countMappedRequiredFields(bestMapping) : 0,
+  };
+}
+
+function buildSheetSnapshotFromMatrix(
+  sheetName: string,
+  matrix: string[][],
+  retainRows = false,
+): WorkbookSheetSnapshot | null {
   if (matrix.length === 0) {
     return null;
   }
 
   const candidate = pickHeaderRow(matrix.slice(0, Math.min(matrix.length, 8)));
-
   if (candidate.headerRowIndex < 0 || candidate.requiredMatches < 4) {
     return null;
   }
 
-  const headers = candidate.headers;
   const rows = matrix.slice(candidate.headerRowIndex + 1).filter((row) =>
     row.some((cell) => cellToText(cell).trim().length > 0),
   );
 
   return {
     sheetName,
-    headers,
+    headers: candidate.headers,
     headerRowIndex: candidate.headerRowIndex,
-    fingerprint: fingerprintHeaders(headers),
+    fingerprint: fingerprintHeaders(candidate.headers),
     mapping: candidate.mapping,
     confidence: Math.min(1, candidate.requiredMatches / orderColumns.filter((column) => column.required).length),
-    rows,
+    rowCount: rows.length,
+    rows: retainRows ? rows : [],
   };
 }
 
@@ -74,9 +115,7 @@ function rowsFromMatrix(
 
   for (let index = headerRowIndex + 1; index < matrix.length; index += 1) {
     const cells = matrix[index] ?? [];
-    const hasAnyValue = cells.some((cell) => cellToText(cell).trim().length > 0);
-
-    if (!hasAnyValue) {
+    if (!cells.some((cell) => cellToText(cell).trim().length > 0)) {
       continue;
     }
 
@@ -101,59 +140,18 @@ function rowsFromMatrix(
   return rows;
 }
 
-function normalizeMatrix(worksheet: XLSX.WorkSheet) {
-  return XLSX.utils
-    .sheet_to_json<(string | number | null)[]>(worksheet, {
-      header: 1,
-      blankrows: false,
-      defval: "",
-      raw: false,
-    })
-    .map((row) => row.map((cell) => cellToText(cell)));
-}
-
-function pickHeaderRow(matrix: string[][]) {
-  let bestIndex = -1;
-  let bestHeaders: string[] = [];
-  let bestMapping: TemplateMapping | null = null;
-  let bestScore = -1;
-
-  matrix.forEach((row, index) => {
-    const headers = row.map((cell) => cellToText(cell)).filter((cell, cellIndex) => cellIndex < 30);
-    const mapping = buildAutoMapping(headers);
-    const score = countMappedRequiredFields(mapping) * 10 + countMappedFields(mapping);
-
-    if (score > bestScore) {
-      bestIndex = index;
-      bestHeaders = headers;
-      bestMapping = mapping;
-      bestScore = score;
+function chooseBestSheet(sheets: WorkbookSheetSnapshot[]) {
+  return [...sheets].sort((left, right) => {
+    if (right.confidence !== left.confidence) {
+      return right.confidence - left.confidence;
     }
-  });
 
-  return {
-    headerRowIndex: bestIndex,
-    headers: bestHeaders,
-    mapping: bestMapping ?? buildAutoMapping([]),
-    requiredMatches: bestMapping ? countMappedRequiredFields(bestMapping) : 0,
-    totalMatches: bestMapping ? countMappedFields(bestMapping) : 0,
-  };
-}
+    if (right.rowCount !== left.rowCount) {
+      return right.rowCount - left.rowCount;
+    }
 
-function buildSheetSnapshot(sheetName: string, worksheet: XLSX.WorkSheet): WorkbookSheetSnapshot | null {
-  const matrix = normalizeMatrix(worksheet);
-
-  if (matrix.length === 0) {
-    return null;
-  }
-
-  const candidate = pickHeaderRow(matrix.slice(0, Math.min(matrix.length, 8)));
-
-  if (candidate.headerRowIndex < 0 || candidate.requiredMatches < 4) {
-    return null;
-  }
-
-  return buildSheetSnapshotFromMatrix(sheetName, matrix);
+    return left.headerRowIndex - right.headerRowIndex;
+  })[0] ?? null;
 }
 
 function remapSavedRuleToHeaders(rule: SavedTemplateRule, headers: string[]) {
@@ -179,14 +177,14 @@ function remapSavedRuleToHeaders(rule: SavedTemplateRule, headers: string[]) {
       }
 
       let score = 0;
-      if (!header || !normalizedSource) {
-        score = 0;
-      } else if (header === normalizedSource) {
-        score = 100;
-      } else if (header.includes(normalizedSource) || normalizedSource.includes(header)) {
-        score = 70;
-      } else if (header.startsWith(normalizedSource) || normalizedSource.startsWith(header)) {
-        score = 55;
+      if (header && normalizedSource) {
+        if (header === normalizedSource) {
+          score = 100;
+        } else if (header.includes(normalizedSource) || normalizedSource.includes(header)) {
+          score = 70;
+        } else if (header.startsWith(normalizedSource) || normalizedSource.startsWith(header)) {
+          score = 55;
+        }
       }
 
       if (score > bestScore) {
@@ -204,24 +202,26 @@ function remapSavedRuleToHeaders(rule: SavedTemplateRule, headers: string[]) {
   return mapping;
 }
 
-function chooseBestSheet(sheets: WorkbookSheetSnapshot[]) {
-  return [...sheets].sort((left, right) => {
-    if (right.confidence !== left.confidence) {
-      return right.confidence - left.confidence;
-    }
-
-    if (right.rows.length !== left.rows.length) {
-      return right.rows.length - left.rows.length;
-    }
-
-    return left.headerRowIndex - right.headerRowIndex;
-  })[0] ?? null;
-}
-
 function buildExistingCodeIndex(details: HistoryDuplicateReference[]) {
   return {
     set: new Set(details.map((item) => item.externalCode)),
     details: new Map(details.map((item) => [item.externalCode, item.displayLabel])),
+  };
+}
+
+function buildWorkbookContextFromSnapshot(snapshot: WorkbookSheetSnapshot) {
+  return {
+    selectedSheetName: snapshot.sheetName,
+    sheets: [
+      {
+        sheetName: snapshot.sheetName,
+        headers: snapshot.headers,
+        headerRowIndex: snapshot.headerRowIndex,
+        fingerprint: snapshot.fingerprint,
+        rowCount: snapshot.rowCount,
+        rows: snapshot.rows,
+      },
+    ],
   };
 }
 
@@ -242,27 +242,52 @@ export async function parseImportWorkbook(fileName: string, buffer: ArrayBuffer)
     throw new Error("Excel 中没有可用的 Sheet。");
   }
 
-  const snapshots = workbook.SheetNames
-    .map((sheetName) => buildSheetSnapshot(sheetName, workbook.Sheets[sheetName]))
-    .filter((sheet): sheet is WorkbookSheetSnapshot => Boolean(sheet));
+  const snapshots: WorkbookSheetSnapshot[] = [];
+  let selectedSheetSnapshot: WorkbookSheetSnapshot | null = null;
+  let selectedSheetMatrix: string[][] | null = null;
 
-  if (!snapshots.length) {
+  for (const sheetName of workbook.SheetNames) {
+    const matrix = normalizeMatrix(workbook.Sheets[sheetName]);
+    const snapshot = buildSheetSnapshotFromMatrix(sheetName, matrix);
+
+    if (!snapshot) {
+      continue;
+    }
+
+    snapshots.push(snapshot);
+
+    if (!selectedSheetSnapshot) {
+      selectedSheetSnapshot = snapshot;
+      selectedSheetMatrix = matrix;
+      continue;
+    }
+
+    const nextBest = chooseBestSheet([selectedSheetSnapshot, snapshot]);
+    if (nextBest?.sheetName === snapshot.sheetName) {
+      selectedSheetSnapshot = snapshot;
+      selectedSheetMatrix = matrix;
+    }
+  }
+
+  if (!snapshots.length || !selectedSheetSnapshot || !selectedSheetMatrix) {
     throw new Error("未识别到有效表头，请检查模板内容或手动选择列映射。");
   }
 
-  const selectedSheet = chooseBestSheet(snapshots);
-
-  if (!selectedSheet) {
-    throw new Error("未找到可导入的数据 Sheet。");
-  }
+  const selectedSheet = {
+    ...selectedSheetSnapshot,
+    rows: selectedSheetMatrix,
+  };
 
   const templateRule = await resolveTemplateRule(selectedSheet.headers, selectedSheet.fingerprint);
   const savedRule = templateRule.rule;
-  const effectiveMapping = savedRule ? remapSavedRuleToHeaders(savedRule, selectedSheet.headers) : selectedSheet.mapping;
+  const effectiveMapping = savedRule
+    ? remapSavedRuleToHeaders(savedRule, selectedSheet.headers)
+    : selectedSheet.mapping;
+
   const draftRows = rowsFromMatrix(
-    selectedSheet.rows.map((row) => row.map((cell) => cellToText(cell))),
+    selectedSheet.rows,
     selectedSheet.sheetName,
-    -1,
+    selectedSheet.headerRowIndex,
     effectiveMapping,
   ).map((row, index) => ({
     ...row,
@@ -272,6 +297,10 @@ export async function parseImportWorkbook(fileName: string, buffer: ArrayBuffer)
   const existingCodes = await listExistingExternalCodes();
   const existingCodeIndex = buildExistingCodeIndex(existingCodes.details);
   const validation = validateOrderRows(draftRows, existingCodeIndex);
+  const selectedSheetSnapshotForPayload = {
+    ...selectedSheet,
+    rowCount: selectedSheet.rowCount,
+  };
 
   const payload: ImportSessionPayload = {
     fileName,
@@ -284,18 +313,14 @@ export async function parseImportWorkbook(fileName: string, buffer: ArrayBuffer)
     suggestedMapping: selectedSheet.mapping,
     savedRule,
     templateRuleMatch: templateRule.match,
-    supportedSheets: snapshots,
+    supportedSheets: snapshots.map((sheet) =>
+      sheet.sheetName === selectedSheet.sheetName
+        ? { ...selectedSheetSnapshotForPayload, rows: selectedSheet.rows }
+        : sheet,
+    ),
     existingExternalCodes: existingCodes.list,
     existingExternalCodeDetails: existingCodes.details,
-    workbookContext: {
-      sheets: snapshots.map((sheet) => ({
-        sheetName: sheet.sheetName,
-        headers: sheet.headers,
-        headerRowIndex: sheet.headerRowIndex,
-        fingerprint: sheet.fingerprint,
-        rows: sheet.rows,
-      })),
-    },
+    workbookContext: buildWorkbookContextFromSnapshot(selectedSheet),
     validationMessages: validation.messages,
     invalidCount: validation.invalidCount,
     validCount: validation.validCount,
@@ -305,32 +330,34 @@ export async function parseImportWorkbook(fileName: string, buffer: ArrayBuffer)
 }
 
 export async function parseImportContext(fileName: string, workbookContext: RawWorkbookContext) {
-  const snapshots = workbookContext.sheets
-    .map((sheet) => buildSheetSnapshotFromMatrix(sheet.sheetName, sheet.rows))
-    .filter((sheet): sheet is WorkbookSheetSnapshot => Boolean(sheet));
+  const selectedSheet =
+    workbookContext.sheets.find((sheet) => sheet.sheetName === workbookContext.selectedSheetName) ??
+    workbookContext.sheets[0];
 
-  if (!snapshots.length) {
+  if (!selectedSheet || !selectedSheet.rows.length) {
     throw new Error("未识别到有效表头，请检查模板内容或手动选择列映射。");
   }
 
-  const selectedSheet = chooseBestSheet(snapshots);
+  const snapshot: WorkbookSheetSnapshot = {
+    sheetName: selectedSheet.sheetName,
+    headers: selectedSheet.headers,
+    headerRowIndex: selectedSheet.headerRowIndex,
+    fingerprint: selectedSheet.fingerprint,
+    mapping: buildAutoMapping(selectedSheet.headers),
+    confidence: 1,
+    rowCount: selectedSheet.rowCount,
+    rows: selectedSheet.rows,
+  };
 
-  if (!selectedSheet) {
-    throw new Error("未找到可导入的数据 Sheet。");
-  }
-
-  const templateRule = await resolveTemplateRule(selectedSheet.headers, selectedSheet.fingerprint);
+  const templateRule = await resolveTemplateRule(snapshot.headers, snapshot.fingerprint);
   const savedRule = templateRule.rule;
-  const effectiveMapping = savedRule ? remapSavedRuleToHeaders(savedRule, selectedSheet.headers) : selectedSheet.mapping;
-  const draftRows = rowsFromMatrix(
-    selectedSheet.rows,
-    selectedSheet.sheetName,
-    -1,
-    effectiveMapping,
-  ).map((row, index) => ({
-    ...row,
-    rowNumber: selectedSheet.headerRowIndex + index + 2,
-  }));
+  const effectiveMapping = savedRule ? remapSavedRuleToHeaders(savedRule, snapshot.headers) : snapshot.mapping;
+  const draftRows = rowsFromMatrix(snapshot.rows, snapshot.sheetName, snapshot.headerRowIndex, effectiveMapping).map(
+    (row, index) => ({
+      ...row,
+      rowNumber: snapshot.headerRowIndex + index + 2,
+    }),
+  );
 
   const existingCodes = await listExistingExternalCodes();
   const existingCodeIndex = buildExistingCodeIndex(existingCodes.details);
@@ -338,27 +365,19 @@ export async function parseImportContext(fileName: string, workbookContext: RawW
 
   return {
     fileName,
-    selectedSheetName: selectedSheet.sheetName,
-    fingerprint: selectedSheet.fingerprint,
-    headers: selectedSheet.headers,
-    headerRowIndex: selectedSheet.headerRowIndex,
+    selectedSheetName: snapshot.sheetName,
+    fingerprint: snapshot.fingerprint,
+    headers: snapshot.headers,
+    headerRowIndex: snapshot.headerRowIndex,
     rows: validation.rows,
     mapping: effectiveMapping,
-    suggestedMapping: selectedSheet.mapping,
+    suggestedMapping: snapshot.mapping,
     savedRule,
     templateRuleMatch: templateRule.match,
-    supportedSheets: snapshots,
+    supportedSheets: [snapshot],
     existingExternalCodes: existingCodes.list,
     existingExternalCodeDetails: existingCodes.details,
-    workbookContext: {
-      sheets: snapshots.map((sheet) => ({
-        sheetName: sheet.sheetName,
-        headers: sheet.headers,
-        headerRowIndex: sheet.headerRowIndex,
-        fingerprint: sheet.fingerprint,
-        rows: sheet.rows,
-      })),
-    },
+    workbookContext: buildWorkbookContextFromSnapshot(snapshot),
     validationMessages: validation.messages,
     invalidCount: validation.invalidCount,
     validCount: validation.validCount,
@@ -384,18 +403,18 @@ export async function rebuildRowsWithMapping(params: {
 
 export function deserializeWorkbookFromJson(jsonText: string) {
   try {
-    const workbook = JSON.parse(jsonText) as {
+    return JSON.parse(jsonText) as {
       fileName: string;
+      selectedSheetName?: string;
       sheets: Array<{
         sheetName: string;
-        headers: string[];
-        headerRowIndex: number;
-        fingerprint: string;
+        headers?: string[];
+        headerRowIndex?: number;
+        fingerprint?: string;
+        rowCount?: number;
         rows: string[][];
       }>;
     };
-
-    return workbook;
   } catch {
     throw new Error("导入上下文损坏，请重新上传 Excel。");
   }

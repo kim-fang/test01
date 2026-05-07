@@ -504,6 +504,10 @@ button {
   text-align: left;
 }
 
+.history-table {
+  min-width: 1320px;
+}
+
 .excel-table th,
 .history-table th {
   position: sticky;
@@ -511,6 +515,19 @@ button {
   z-index: 1;
   background: #f7efe3;
   font-size: 0.92rem;
+}
+
+.history-table th:last-child,
+.history-table td:last-child {
+  position: sticky;
+  right: 0;
+  z-index: 2;
+  background: #fffaf3;
+  box-shadow: -10px 0 18px rgba(107, 75, 42, 0.06);
+}
+
+.history-table th:last-child {
+  background: #f5ead8;
 }
 
 .table-empty {
@@ -522,6 +539,17 @@ button {
 .row-number {
   color: var(--muted);
   font-weight: 700;
+}
+
+.selection-col {
+  width: 56px;
+  text-align: center;
+}
+
+.selection-col input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--brand);
 }
 
 .cell-display {
@@ -577,6 +605,12 @@ button {
 
 .link-button.danger {
   color: var(--danger);
+  background: rgba(203, 75, 63, 0.08);
+  font-weight: 700;
+}
+
+.history-actions-top {
+  justify-content: flex-end;
 }
 
 @media (max-width: 1320px) {

@@ -47,6 +47,7 @@ export const workbookSheetSnapshotSchema = z.object({
   fingerprint: z.string().min(1),
   mapping: templateMappingSchema,
   confidence: z.number().min(0).max(1),
+  rowCount: z.number().int().nonnegative(),
   rows: z.array(z.array(z.string())),
 });
 
@@ -89,12 +90,14 @@ export const importSessionPayloadSchema = z.object({
   existingExternalCodeDetails: z.array(historyDuplicateReferenceSchema),
   templateRuleMatch: templateRuleMatchSchema,
   workbookContext: z.object({
+    selectedSheetName: z.string().min(1),
     sheets: z.array(
       z.object({
         sheetName: z.string().min(1),
         headers: z.array(z.string()),
         headerRowIndex: z.number().int().nonnegative(),
         fingerprint: z.string().min(1),
+        rowCount: z.number().int().nonnegative(),
         rows: z.array(z.array(z.string())),
       }),
     ),
@@ -105,9 +108,14 @@ export const importSessionPayloadSchema = z.object({
 });
 
 export const rawWorkbookContextSchema = z.object({
+  selectedSheetName: z.string().min(1),
   sheets: z.array(
     z.object({
       sheetName: z.string().min(1),
+      headers: z.array(z.string()),
+      headerRowIndex: z.number().int().nonnegative(),
+      fingerprint: z.string().min(1),
+      rowCount: z.number().int().nonnegative(),
       rows: z.array(z.array(z.string())),
     }),
   ),
@@ -133,12 +141,14 @@ export const remapPayloadSchema = z.object({
   fingerprint: z.string().min(1),
   mapping: templateMappingSchema,
   workbookContext: z.object({
+    selectedSheetName: z.string().min(1),
     sheets: z.array(
       z.object({
         sheetName: z.string().min(1),
         headers: z.array(z.string()),
         headerRowIndex: z.number().int().nonnegative(),
         fingerprint: z.string().min(1),
+        rowCount: z.number().int().nonnegative(),
         rows: z.array(z.array(z.string())),
       }),
     ),
@@ -159,6 +169,10 @@ export const historyQuerySchema = z.object({
   dateTo: z.string().trim().default(""),
   page: z.coerce.number().int().positive().default(1),
   pageSize: z.coerce.number().int().positive().max(100).default(10),
+});
+
+export const historyDeletePayloadSchema = z.object({
+  ids: z.array(z.string().min(1)).min(1),
 });
 
 export const exportColumns = orderColumns;

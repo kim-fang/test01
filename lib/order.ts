@@ -43,6 +43,7 @@ export type WorkbookSheetSnapshot = {
   fingerprint: string;
   mapping: TemplateMapping;
   confidence: number;
+  rowCount: number;
   rows: string[][];
 };
 
@@ -203,8 +204,40 @@ export function normalizeCode(value: unknown) {
   return normalizeText(value).replace(/\s+/g, "");
 }
 
-export function fingerprintHeaders(headers: string[]) {
+export function legacyFingerprintHeaders(headers: string[]) {
   return headers.map((header) => normalizeHeader(header)).join("|");
+}
+
+export function fingerprintHeaders(headers: string[]) {
+  const normalizedHeaders = headers.map((header) => normalizeHeader(header));
+  const mapping = buildAutoMapping(headers);
+  const usedIndices = new Set<number>();
+  const segments: string[] = [];
+
+  for (const field of orderFieldKeys) {
+    const columnIndex = mapping[field];
+    if (columnIndex === null || columnIndex === undefined) {
+      continue;
+    }
+
+    usedIndices.add(columnIndex);
+    const header = normalizedHeaders[columnIndex] ?? "";
+    segments.push(`${field}@${columnIndex}:${header || "x"}`);
+  }
+
+  normalizedHeaders.forEach((header, index) => {
+    if (!header || usedIndices.has(index)) {
+      return;
+    }
+
+    segments.push(`u${index}:${header}`);
+  });
+
+  if (!segments.length) {
+    return legacyFingerprintHeaders(headers);
+  }
+
+  return segments.join("|");
 }
 
 function aliasScore(header: string, alias: string) {

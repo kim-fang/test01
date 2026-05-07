@@ -1,6 +1,10 @@
 import { NextResponse } from "next/server";
-import { listHistory, submitOrders } from "@/lib/orders";
-import { historyQuerySchema, submitOrdersPayloadSchema } from "@/lib/validation";
+import { deleteHistoryOrders, listHistory, submitOrders } from "@/lib/orders";
+import {
+  historyDeletePayloadSchema,
+  historyQuerySchema,
+  submitOrdersPayloadSchema,
+} from "@/lib/validation";
 import type { OrderDraftRow } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -57,6 +61,16 @@ export async function POST(request: Request) {
       sourceFingerprint: payload.sourceFingerprint,
     });
     return NextResponse.json({ data }, { status: 201 });
+  } catch (error) {
+    return handleError(error);
+  }
+}
+
+export async function DELETE(request: Request) {
+  try {
+    const payload = historyDeletePayloadSchema.parse(await request.json());
+    const data = await deleteHistoryOrders(payload.ids);
+    return NextResponse.json({ data });
   } catch (error) {
     return handleError(error);
   }

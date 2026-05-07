@@ -295,10 +295,13 @@ export function UniversalImportApp() {
   const [exportingPreview, setExportingPreview] = useState(false);
   const [session, setSession] = useState<ImportSessionPayload | null>(null);
   const [rows, setRows] = useState<OrderDraftRow[]>([]);
+  const [selectedRowIds, setSelectedRowIds] = useState<string[]>([]);
   const [historyRows, setHistoryRows] = useState<OrderHistoryItem[]>([]);
+  const [selectedHistoryIds, setSelectedHistoryIds] = useState<string[]>([]);
   const [historyTotal, setHistoryTotal] = useState(0);
   const [historyPage, setHistoryPage] = useState(1);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyDeleting, setHistoryDeleting] = useState(false);
   const [historyFilters, setHistoryFilters] = useState<HistoryFilters>(emptyFilters);
   const [draftHistoryFilters, setDraftHistoryFilters] = useState<HistoryFilters>(emptyFilters);
   const [editingCell, setEditingCell] = useState<{
@@ -312,6 +315,12 @@ export function UniversalImportApp() {
   const selectedSheetSnapshot = session
     ? session.supportedSheets.find((sheet) => sheet.sheetName === session.selectedSheetName) ?? null
     : null;
+  const selectedHistoryIdSet = useMemo(() => new Set(selectedHistoryIds), [selectedHistoryIds]);
+  const selectedHistoryCount = selectedHistoryIds.length;
+  const allHistoryRowsSelected = historyRows.length > 0 && selectedHistoryCount === historyRows.length;
+  const selectedRowIdSet = useMemo(() => new Set(selectedRowIds), [selectedRowIds]);
+  const selectedRowCount = selectedRowIds.length;
+  const allRowsSelected = rows.length > 0 && selectedRowCount === rows.length;
 
   const validationSummary = useMemo(() => {
     if (!rows.length) {
@@ -353,6 +362,7 @@ export function UniversalImportApp() {
       setHistoryRows(payload.data.items);
       setHistoryTotal(payload.data.total);
       setHistoryPage(payload.data.page);
+      setSelectedHistoryIds([]);
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : "历史运单加载失败。");
     } finally {
@@ -379,10 +389,11 @@ export function UniversalImportApp() {
   async function handleFile(file: File) {
     clearFeedback();
     setImporting(true);
-    setImportProgress(createProgress("准备解析文件", 0, 100));
+    setImportProgress(createProgress("reading file", 0, file.size || 1));
     setSubmitProgress(null);
     setSession(null);
     setRows([]);
+    setSelectedRowIds([]);
     setEditingCell(null);
     pendingNavigationRef.current = null;
     setMappingOpen(false);
@@ -394,11 +405,11 @@ export function UniversalImportApp() {
       const parsedWorkbook = await parseWorkbookInWorker(file.name, buffer, (progress) => {
         setImportProgress(progress);
       });
-      const workbookRowCount = parsedWorkbook.workbookContext.sheets.reduce(
-        (sum, sheet) => sum + sheet.rows.length,
-        0,
-      );
-      setImportProgress(createProgress("套用模板规则并校验数据", 0, Math.max(workbookRowCount, 1)));
+      const workbookRowCount =
+        parsedWorkbook.workbookContext.sheets[0]?.rowCount ??
+        parsedWorkbook.workbookContext.sheets[0]?.rows.length ??
+        1;
+      setImportProgress(createProgress("validating workbook", workbookRowCount, workbookRowCount || 1));
 
       const response = await fetch("/api/import/parse", {
         method: "POST",
@@ -410,22 +421,23 @@ export function UniversalImportApp() {
       const payload = await readJson<ApiSuccess<ImportSessionPayload>>(response);
 
       if (!response.ok || !payload.data) {
-        throw new Error(payload.error ?? "导入解析失败。");
+        throw new Error(payload.error ?? "Import parsing failed.");
       }
 
       setSession(payload.data);
       setRows(payload.data.rows);
+      setSelectedRowIds([]);
       setMappingDraft(normalizeMapping(payload.data.mapping));
-      setImportProgress(createProgress("完成", payload.data.rows.length, payload.data.rows.length || 1));
+      setImportProgress(createProgress("done", payload.data.rows.length, payload.data.rows.length || 1));
       setNotice(
         payload.data.templateRuleMatch.mode === "exact"
-          ? `已精确命中记忆模板，识别到 ${payload.data.rows.length} 条数据。`
+          ? "exact template matched: " + payload.data.rows.length + " rows"
           : payload.data.templateRuleMatch.mode === "similar"
-            ? `已相似命中记忆模板，识别到 ${payload.data.rows.length} 条数据。`
-            : `已识别模板并导入 ${payload.data.rows.length} 条数据。`,
+            ? "similar template matched: " + payload.data.rows.length + " rows"
+            : "template recognized: " + payload.data.rows.length + " rows",
       );
     } catch (importError) {
-      setError(importError instanceof Error ? importError.message : "导入失败。");
+      setError(importError instanceof Error ? importError.message : "Import failed.");
     } finally {
       setImporting(false);
     }
@@ -466,6 +478,7 @@ export function UniversalImportApp() {
 
   function handleDeleteRow(rowId: string) {
     clearFeedback();
+    setSelectedRowIds((current) => current.filter((id) => id !== rowId));
     setRows((current) =>
       current
         .filter((row) => row.id !== rowId)
@@ -481,6 +494,107 @@ export function UniversalImportApp() {
     setRows((current) => [...current, createBlankOrderRow(current.length + 2, session?.selectedSheetName ?? "")]);
   }
 
+  function handleToggleRowSelection(rowId: string, checked: boolean) {
+    setSelectedRowIds((current) => {
+      if (checked) {
+        return current.includes(rowId) ? current : [...current, rowId];
+      }
+
+      return current.filter((id) => id !== rowId);
+    });
+  }
+
+  function handleToggleAllRows(checked: boolean) {
+    setSelectedRowIds(checked ? rows.map((row) => row.id) : []);
+  }
+
+  function handleBatchDeleteSelectedRows() {
+    if (!selectedRowIds.length) {
+      return;
+    }
+
+    clearFeedback();
+    const selectedSet = new Set(selectedRowIds);
+    setRows((current) =>
+      current
+        .filter((row) => !selectedSet.has(row.id))
+        .map((row, index) => ({
+          ...row,
+          rowNumber: index + 2,
+        })),
+    );
+    setSelectedRowIds([]);
+  }
+
+  async function deleteHistoryRows(ids: string[]) {
+    if (!ids.length || historyDeleting) {
+      return;
+    }
+
+    clearFeedback();
+    setHistoryDeleting(true);
+
+    try {
+      const response = await fetch("/api/orders", {
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ ids }),
+      });
+      const payload = await readJson<ApiSuccess<{ deletedCount: number; deletedIds: string[] }>>(response);
+
+      if (!response.ok || !payload.data) {
+        throw new Error(payload.error ?? "历史运单删除失败。");
+      }
+
+      const nextTotal = Math.max(0, historyTotal - payload.data.deletedCount);
+      const nextPage = Math.min(historyPage, Math.max(1, Math.ceil(nextTotal / historyPageSize)));
+
+      setNotice(`已删除 ${payload.data.deletedCount} 条历史运单。`);
+      setSelectedHistoryIds((current) => current.filter((id) => !payload.data.deletedIds.includes(id)));
+      await loadHistory(nextPage, historyFilters);
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : "历史运单删除失败。");
+    } finally {
+      setHistoryDeleting(false);
+    }
+  }
+
+  function handleToggleHistoryRowSelection(rowId: string, checked: boolean) {
+    setSelectedHistoryIds((current) => {
+      if (checked) {
+        return current.includes(rowId) ? current : [...current, rowId];
+      }
+
+      return current.filter((id) => id !== rowId);
+    });
+  }
+
+  function handleToggleAllHistoryRows(checked: boolean) {
+    setSelectedHistoryIds(checked ? historyRows.map((row) => row.id) : []);
+  }
+
+  async function handleDeleteHistoryRow(rowId: string) {
+    if (!window.confirm("确定删除这条历史运单吗？")) {
+      return;
+    }
+
+    await deleteHistoryRows([rowId]);
+  }
+
+  async function handleDeleteSelectedHistoryRows() {
+    if (!selectedHistoryIds.length) {
+      return;
+    }
+
+    if (!window.confirm(`确定删除选中的 ${selectedHistoryIds.length} 条历史运单吗？`)) {
+      return;
+    }
+
+    await deleteHistoryRows(selectedHistoryIds);
+  }
+
   async function applyMapping() {
     if (!session || !mappingDraft) {
       return;
@@ -488,7 +602,7 @@ export function UniversalImportApp() {
 
     clearFeedback();
     setImporting(true);
-    setImportProgress(createProgress("应用手动映射", 10, 100));
+    setImportProgress(createProgress("applying mapping", session.rows.length || 1, session.rows.length || 1));
 
     try {
       const response = await fetch("/api/import/remap", {
@@ -515,7 +629,7 @@ export function UniversalImportApp() {
       >(response);
 
       if (!response.ok || !payload.data) {
-        throw new Error(payload.error ?? "映射应用失败。");
+        throw new Error(payload.error ?? "Mapping failed.");
       }
 
       const updatedSession: ImportSessionPayload = {
@@ -529,7 +643,8 @@ export function UniversalImportApp() {
 
       setSession(updatedSession);
       setRows(payload.data.rows);
-      setImportProgress(createProgress("保存模板记忆", 80, 100));
+      setSelectedRowIds([]);
+      setImportProgress(createProgress("saving template memory", payload.data.rows.length || 1, payload.data.rows.length || 1));
 
       const saveResponse = await fetch("/api/template-rules", {
         method: "POST",
@@ -546,14 +661,14 @@ export function UniversalImportApp() {
       });
       if (!saveResponse.ok) {
         const savePayload = (await readJson<ApiSuccess<unknown>>(saveResponse)) as ApiSuccess<unknown>;
-        throw new Error(savePayload.error ?? "模板记忆保存失败。");
+        throw new Error(savePayload.error ?? "Template memory save failed.");
       }
 
-      setNotice("已应用新映射并保存模板记忆，下次相同表头会自动匹配。");
+      setNotice("Mapping applied and template memory saved.");
       setMappingOpen(false);
-      setImportProgress(createProgress("完成", payload.data.rows.length || 1, payload.data.rows.length || 1));
+      setImportProgress(createProgress("done", payload.data.rows.length || 1, payload.data.rows.length || 1));
     } catch (mapError) {
-      setError(mapError instanceof Error ? mapError.message : "映射应用失败。");
+      setError(mapError instanceof Error ? mapError.message : "Mapping failed.");
     } finally {
       setImporting(false);
     }
@@ -585,26 +700,27 @@ export function UniversalImportApp() {
 
   async function submitOrders() {
     if (!session) {
-      setNotice("请先导入 Excel。");
+      setNotice("Please import an Excel file first.");
       return;
     }
 
     if (!rows.length) {
-      setNotice("当前没有可提交的数据。");
+      setNotice("No rows to submit.");
       return;
     }
 
     if (validationSummary.invalidCount > 0) {
-      setError("当前仍有错误行，请先修正后再提交下单。");
+      setError("There are still invalid rows. Please fix them before submitting.");
       return;
     }
 
     clearFeedback();
     setSubmitting(true);
-    setSubmitProgress(createProgress("准备提交", 0, rows.length));
+    setSubmitProgress(createProgress("preparing", 0, rows.length));
+    setSelectedRowIds([]);
 
     try {
-      const chunkSize = 100;
+      const chunkSize = Math.max(20, Math.min(100, Math.ceil(rows.length / 20)));
       let processedCount = 0;
       let successCount = 0;
       let failureCount = 0;
@@ -612,7 +728,7 @@ export function UniversalImportApp() {
 
       for (let startIndex = 0; startIndex < rows.length; startIndex += chunkSize) {
         const chunkRows = rows.slice(startIndex, startIndex + chunkSize);
-        setSubmitProgress(createProgress("提交下单", processedCount, rows.length));
+        setSubmitProgress(createProgress("submitting", processedCount, rows.length));
 
         const response = await fetch("/api/orders", {
           method: "POST",
@@ -630,30 +746,23 @@ export function UniversalImportApp() {
           ApiSuccess<{
             successCount: number;
             failureCount: number;
-            failures: Array<{ rowNumber: number; reason: string }>;
+            failures: Array<{ rowNumber: number; reason: string }>; 
           }>
         >(response);
 
         if (!response.ok || !payload.data) {
-          throw new Error(payload.error ?? "提交下单失败。");
+          throw new Error(payload.error ?? "Submit failed.");
         }
 
         successCount += payload.data.successCount;
         failureCount += payload.data.failureCount;
         failures.push(...payload.data.failures);
         processedCount += chunkRows.length;
-        setSubmitProgress(createProgress("提交下单", processedCount, rows.length));
+        setSubmitProgress(createProgress("submitting", processedCount, rows.length));
       }
 
-      setSubmitProgress(createProgress("完成", rows.length, rows.length));
-      setNotice(
-        failureCount > 0
-          ? `提交完成，成功 ${successCount} 条，失败 ${failureCount} 条。失败详情：${failures
-              .slice(0, 3)
-              .map((item) => `第 ${item.rowNumber} 行 ${item.reason}`)
-              .join("；")}`
-          : `提交完成，成功 ${successCount} 条，失败 ${failureCount} 条。`,
-      );
+      setSubmitProgress(createProgress("done", rows.length, rows.length));
+      setNotice("Submit complete. Success " + successCount + ", failed " + failureCount + ".");
 
       if (failureCount > 0) {
         const failedRowNumbers = new Set(failures.map((item) => item.rowNumber));
@@ -668,7 +777,7 @@ export function UniversalImportApp() {
 
       await loadHistory(1, historyFilters);
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "提交失败。");
+      setError(submitError instanceof Error ? submitError.message : "Submit failed.");
     } finally {
       setSubmitting(false);
     }
@@ -921,7 +1030,7 @@ export function UniversalImportApp() {
                         <span>{isSelected ? "当前采用" : "候选"}</span>
                       </div>
                       <p>表头：第 {sheet.headerRowIndex + 1} 行</p>
-                      <p>可导入数据：{sheet.rows.length} 条</p>
+                      <p>可导入数据：{sheet.rowCount} 条</p>
                       <p>识别置信度：{Math.round(sheet.confidence * 100)}%</p>
                     </div>
                   );
@@ -994,6 +1103,14 @@ export function UniversalImportApp() {
               <button
                 type="button"
                 className="secondary-action"
+                onClick={handleBatchDeleteSelectedRows}
+                disabled={!selectedRowCount}
+              >
+                删除选中 ({selectedRowCount})
+              </button>
+              <button
+                type="button"
+                className="secondary-action"
                 onClick={() => void exportPreview()}
                 disabled={!rows.length || exportingPreview}
               >
@@ -1030,6 +1147,14 @@ export function UniversalImportApp() {
             <table className="excel-table">
               <thead>
                 <tr>
+                  <th className="selection-col">
+                    <input
+                      type="checkbox"
+                      checked={allRowsSelected}
+                      onChange={(event) => handleToggleAllRows(event.target.checked)}
+                      aria-label="Select all preview rows"
+                    />
+                  </th>
                   <th>行号</th>
                   {orderColumns.map((column) => (
                     <th key={column.key} style={{ minWidth: column.width }}>
@@ -1044,13 +1169,21 @@ export function UniversalImportApp() {
               <tbody>
                 {rows.length === 0 ? (
                   <tr>
-                    <td colSpan={orderColumns.length + 2} className="table-empty">
+                    <td colSpan={orderColumns.length + 3} className="table-empty">
                       上传 Excel 后，这里会显示所有预览数据，并支持逐格编辑与实时校验。
                     </td>
                   </tr>
                 ) : (
                   rows.map((row) => (
                     <tr key={row.id} className={Object.keys(row.errors).length > 0 ? "error-row" : ""}>
+                      <td className="selection-col">
+                        <input
+                          type="checkbox"
+                          checked={selectedRowIdSet.has(row.id)}
+                          onChange={(event) => handleToggleRowSelection(row.id, event.target.checked)}
+                          aria-label={`Select row ${row.rowNumber}`}
+                        />
+                      </td>
                       <td className="row-number">{row.rowNumber}</td>
                       {orderColumns.map((column) => {
                         const isEditing =
@@ -1172,6 +1305,16 @@ export function UniversalImportApp() {
               <span className="eyebrow">模块四 · 已导入运单列表</span>
               <h3>历史运单查询</h3>
             </div>
+            <div className="toolbar-actions history-actions history-actions-top">
+              <button
+                type="button"
+                className="secondary-action"
+                onClick={() => void handleDeleteSelectedHistoryRows()}
+                disabled={!selectedHistoryCount || historyDeleting}
+              >
+                {historyDeleting ? "删除中..." : `删除选中 (${selectedHistoryCount})`}
+              </button>
+            </div>
           </div>
 
           <div className="history-filter-grid">
@@ -1255,6 +1398,14 @@ export function UniversalImportApp() {
             <table className="history-table">
               <thead>
                 <tr>
+                  <th className="selection-col">
+                    <input
+                      type="checkbox"
+                      checked={allHistoryRowsSelected}
+                      onChange={(event) => handleToggleAllHistoryRows(event.target.checked)}
+                      aria-label="Select all history rows"
+                    />
+                  </th>
                   <th>提交时间</th>
                   <th>外部编码</th>
                   <th>发件人</th>
@@ -1263,24 +1414,33 @@ export function UniversalImportApp() {
                   <th>件数</th>
                   <th>温层</th>
                   <th>来源模板</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
                 {historyLoading ? (
                   <tr>
-                    <td colSpan={8} className="table-empty">
+                    <td colSpan={10} className="table-empty">
                       正在加载历史运单...
                     </td>
                   </tr>
                 ) : historyRows.length === 0 ? (
                   <tr>
-                    <td colSpan={8} className="table-empty">
+                    <td colSpan={10} className="table-empty">
                       暂无符合条件的历史运单。
                     </td>
                   </tr>
                 ) : (
                   historyRows.map((item) => (
                     <tr key={item.id}>
+                      <td className="selection-col">
+                        <input
+                          type="checkbox"
+                          checked={selectedHistoryIdSet.has(item.id)}
+                          onChange={(event) => handleToggleHistoryRowSelection(item.id, event.target.checked)}
+                          aria-label={`Select history row ${item.id}`}
+                        />
+                      </td>
                       <td>{new Date(item.submittedAt).toLocaleString("zh-CN")}</td>
                       <td>{item.externalCode || "-"}</td>
                       <td>{item.senderName}</td>
@@ -1289,6 +1449,16 @@ export function UniversalImportApp() {
                       <td>{item.quantity}</td>
                       <td>{item.temperature}</td>
                       <td>{item.sourceTemplateName || "-"}</td>
+                      <td>
+                        <button
+                          type="button"
+                          className="link-button danger"
+                          onClick={() => void handleDeleteHistoryRow(item.id)}
+                          disabled={historyDeleting}
+                        >
+                          删除
+                        </button>
+                      </td>
                     </tr>
                   ))
                 )}

@@ -47,8 +47,13 @@ export type HistoryDuplicateReference = {
 };
 
 export type RawWorkbookContext = {
+  selectedSheetName: string;
   sheets: Array<{
     sheetName: string;
+    headers: string[];
+    headerRowIndex: number;
+    fingerprint: string;
+    rowCount: number;
     rows: string[][];
   }>;
 };
@@ -68,11 +73,13 @@ export type ImportSessionPayload = {
   existingExternalCodeDetails: HistoryDuplicateReference[];
   templateRuleMatch: TemplateRuleMatchInfo;
   workbookContext: {
+    selectedSheetName: string;
     sheets: Array<{
       sheetName: string;
       headers: string[];
       headerRowIndex: number;
       fingerprint: string;
+      rowCount: number;
       rows: string[][];
     }>;
   };
