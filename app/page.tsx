@@ -1,5 +1,5 @@
-import { MessageBoard } from "@/components/message-board";
+import { UniversalImportApp } from "@/components/universal-import-app";
 
 export default function HomePage() {
-  return <MessageBoard />;
+  return <UniversalImportApp />;
 }

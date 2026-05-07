@@ -14,8 +14,8 @@ const bodyFont = Noto_Sans_SC({
 });
 
 export const metadata: Metadata = {
-  title: "Vercel 网点管理台",
-  description: "基于 Next.js API Routes 与 Postgres 的网点管理后台示例。",
+  title: "万能导入下单系统",
+  description: "支持多模板 Excel 自动识别、预览编辑、批量提交和历史运单查看的全栈示例。",
 };
 
 export default function RootLayout({

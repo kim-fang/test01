@@ -1,0 +1,1031 @@
+"use client";
+
+import { startTransition, useEffect, useMemo, useRef, useState } from "react";
+import * as XLSX from "xlsx";
+import {
+  createBlankOrderRow,
+  normalizeCode,
+  orderColumns,
+  orderFieldKeys,
+  temperatureOptions,
+  validateOrderRows,
+} from "@/lib/order";
+import type {
+  HistoryListPayload,
+  ImportProgress,
+  ImportSessionPayload,
+  OrderDraftRow,
+  OrderFieldKey,
+  OrderHistoryItem,
+  TemplateMapping,
+} from "@/lib/types";
+
+type ApiSuccess<T> = {
+  data: T;
+  error?: string;
+};
+
+type HistoryFilters = {
+  externalCode: string;
+  receiverName: string;
+  dateFrom: string;
+  dateTo: string;
+};
+
+type SaveFilePickerWindow = Window & {
+  showSaveFilePicker?: (options?: {
+    suggestedName?: string;
+    types?: Array<{
+      description: string;
+      accept: Record<string, string[]>;
+    }>;
+  }) => Promise<{
+    createWritable: () => Promise<{
+      write: (data: Blob | BufferSource | string) => Promise<void>;
+      close: () => Promise<void>;
+    }>;
+  }>;
+};
+
+const emptyFilters: HistoryFilters = {
+  externalCode: "",
+  receiverName: "",
+  dateFrom: "",
+  dateTo: "",
+};
+
+async function readJson<T>(response: Response) {
+  return (await response.json()) as T;
+}
+
+function createProgress(stage: string, current: number, total: number): ImportProgress {
+  return {
+    stage,
+    current,
+    total,
+    percent: total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 0,
+  };
+}
+
+function buildExportWorkbook(rows: OrderDraftRow[]) {
+  const worksheet = XLSX.utils.aoa_to_sheet([
+    orderColumns.map((column) => column.label),
+    ...rows.map((row) =>
+      orderColumns.map((column) => {
+        return row.values[column.key];
+      }),
+    ),
+  ]);
+
+  worksheet["!cols"] = orderColumns.map((column) => ({
+    wch: Math.max(12, Math.floor(column.width / 8)),
+  }));
+
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, "预览数据");
+  return workbook;
+}
+
+function buildExportFileName(prefix: string) {
+  const stamp = new Intl.DateTimeFormat("sv-SE", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  })
+    .format(new Date())
+    .replaceAll("-", "")
+    .replaceAll(":", "")
+    .replace(" ", "-");
+
+  return `${prefix}-${stamp}.xlsx`;
+}
+
+async function saveWorkbookFile(workbook: XLSX.WorkBook, fileName: string) {
+  const buffer = XLSX.write(workbook, {
+    bookType: "xlsx",
+    type: "array",
+  });
+  const blob = new Blob([buffer], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  });
+  const pickerWindow = window as SaveFilePickerWindow;
+
+  if (pickerWindow.showSaveFilePicker) {
+    const handle = await pickerWindow.showSaveFilePicker({
+      suggestedName: fileName,
+      types: [
+        {
+          description: "Excel 工作簿",
+          accept: {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+          },
+        },
+      ],
+    });
+
+    const writable = await handle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+    return;
+  }
+
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = fileName;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+function getErrorText(row: OrderDraftRow, field: OrderFieldKey) {
+  return row.errors[field]?.join("；") ?? "";
+}
+
+function normalizeMapping(mapping: TemplateMapping) {
+  return Object.fromEntries(orderFieldKeys.map((field) => [field, mapping[field] ?? null])) as TemplateMapping;
+}
+
+export function UniversalImportApp() {
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [importProgress, setImportProgress] = useState<ImportProgress | null>(null);
+  const [submitProgress, setSubmitProgress] = useState<ImportProgress | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [exportingPreview, setExportingPreview] = useState(false);
+  const [session, setSession] = useState<ImportSessionPayload | null>(null);
+  const [rows, setRows] = useState<OrderDraftRow[]>([]);
+  const [historyRows, setHistoryRows] = useState<OrderHistoryItem[]>([]);
+  const [historyTotal, setHistoryTotal] = useState(0);
+  const [historyPage, setHistoryPage] = useState(1);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyFilters, setHistoryFilters] = useState<HistoryFilters>(emptyFilters);
+  const [draftHistoryFilters, setDraftHistoryFilters] = useState<HistoryFilters>(emptyFilters);
+  const [editingCell, setEditingCell] = useState<{
+    rowId: string;
+    field: OrderFieldKey;
+  } | null>(null);
+  const [mappingOpen, setMappingOpen] = useState(false);
+  const [mappingDraft, setMappingDraft] = useState<TemplateMapping | null>(null);
+
+  const historyPageSize = 10;
+
+  const validationSummary = useMemo(() => {
+    if (!rows.length) {
+      return {
+        invalidCount: 0,
+        validCount: 0,
+        messages: [] as string[],
+      };
+    }
+
+    const existingCodes = new Set(
+      (session?.existingExternalCodes ?? []).map((value) => normalizeCode(value)).filter((value) => value.length > 0),
+    );
+
+    const validation = validateOrderRows(rows, existingCodes);
+    return {
+      invalidCount: validation.invalidCount,
+      validCount: validation.validCount,
+      messages: validation.messages,
+    };
+  }, [rows, session?.existingExternalCodes]);
+
+  async function loadHistory(page = historyPage, filters = historyFilters) {
+    setHistoryLoading(true);
+    try {
+      const params = new URLSearchParams({
+        page: `${page}`,
+        pageSize: `${historyPageSize}`,
+        externalCode: filters.externalCode,
+        receiverName: filters.receiverName,
+        dateFrom: filters.dateFrom,
+        dateTo: filters.dateTo,
+      });
+      const response = await fetch(`/api/orders?${params.toString()}`, {
+        cache: "no-store",
+      });
+      const payload = await readJson<ApiSuccess<HistoryListPayload>>(response);
+
+      if (!response.ok || !payload.data) {
+        throw new Error(payload.error ?? "历史运单加载失败。");
+      }
+
+      setHistoryRows(payload.data.items);
+      setHistoryTotal(payload.data.total);
+      setHistoryPage(payload.data.page);
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "历史运单加载失败。");
+    } finally {
+      setHistoryLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    const bootFilters = emptyFilters;
+    startTransition(() => {
+      setHistoryFilters(bootFilters);
+      setDraftHistoryFilters(bootFilters);
+      void loadHistory(1, bootFilters);
+    });
+    // Initial history bootstrap only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function clearFeedback() {
+    setNotice(null);
+    setError(null);
+  }
+
+  async function handleFile(file: File) {
+    clearFeedback();
+    setImporting(true);
+    setImportProgress(createProgress("准备解析文件", 0, 100));
+    setSession(null);
+    setRows([]);
+
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+
+      setImportProgress(createProgress("上传文件", 15, 100));
+      const response = await fetch("/api/import/parse", {
+        method: "POST",
+        body: formData,
+      });
+
+      setImportProgress(createProgress("解析模板与映射字段", 70, 100));
+      const payload = await readJson<ApiSuccess<ImportSessionPayload>>(response);
+
+      if (!response.ok || !payload.data) {
+        throw new Error(payload.error ?? "导入解析失败。");
+      }
+
+      setSession(payload.data);
+      setRows(payload.data.rows);
+      setMappingDraft(normalizeMapping(payload.data.mapping));
+      setImportProgress(createProgress("完成", payload.data.rows.length, payload.data.rows.length || 1));
+      setNotice(
+        payload.data.savedRule
+          ? `已自动应用记忆模板规则，识别到 ${payload.data.rows.length} 条数据。`
+          : `已识别模板并导入 ${payload.data.rows.length} 条数据。`,
+      );
+    } catch (importError) {
+      setError(importError instanceof Error ? importError.message : "导入失败。");
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  function handleDrop(event: React.DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    setDragging(false);
+    const file = event.dataTransfer.files?.[0];
+    if (file) {
+      void handleFile(file);
+    }
+  }
+
+  function handleEditValue(rowId: string, field: OrderFieldKey, value: string) {
+    clearFeedback();
+    setRows((current) =>
+      current.map((row) =>
+        row.id === rowId
+          ? {
+              ...row,
+              values: {
+                ...row.values,
+                [field]: value,
+              },
+            }
+          : row,
+      ),
+    );
+  }
+
+  function commitValidationAfterEdit() {
+    if (!rows.length) {
+      return;
+    }
+
+    const existingCodes = new Set(
+      (session?.existingExternalCodes ?? []).map((value) => normalizeCode(value)).filter((value) => value.length > 0),
+    );
+
+    const validation = validateOrderRows(rows, existingCodes);
+    setRows(validation.rows);
+  }
+
+  function handleDeleteRow(rowId: string) {
+    clearFeedback();
+    setRows((current) =>
+      current
+        .filter((row) => row.id !== rowId)
+        .map((row, index) => ({
+          ...row,
+          rowNumber: index + 2,
+        })),
+    );
+  }
+
+  function handleAddEmptyRow() {
+    clearFeedback();
+    setRows((current) => [...current, createBlankOrderRow(current.length + 2, session?.selectedSheetName ?? "")]);
+  }
+
+  async function applyMapping() {
+    if (!session || !mappingDraft) {
+      return;
+    }
+
+    clearFeedback();
+    setImporting(true);
+    setImportProgress(createProgress("应用手动映射", 10, 100));
+
+    try {
+      const response = await fetch("/api/import/remap", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          selectedSheetName: session.selectedSheetName,
+          headers: session.headers,
+          headerRowIndex: session.headerRowIndex,
+          fingerprint: session.fingerprint,
+          mapping: mappingDraft,
+          workbookContext: session.workbookContext,
+        }),
+      });
+      const payload = await readJson<
+        ApiSuccess<{
+          rows: OrderDraftRow[];
+          validationMessages: string[];
+          invalidCount: number;
+          validCount: number;
+        }>
+      >(response);
+
+      if (!response.ok || !payload.data) {
+        throw new Error(payload.error ?? "映射应用失败。");
+      }
+
+      const updatedSession: ImportSessionPayload = {
+        ...session,
+        mapping: mappingDraft,
+        rows: payload.data.rows,
+        validationMessages: payload.data.validationMessages,
+        invalidCount: payload.data.invalidCount,
+        validCount: payload.data.validCount,
+      };
+
+      setSession(updatedSession);
+      setRows(payload.data.rows);
+      setImportProgress(createProgress("保存模板记忆", 80, 100));
+
+      await fetch("/api/template-rules", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          fingerprint: session.fingerprint,
+          sheetName: session.selectedSheetName,
+          headerRowIndex: session.headerRowIndex,
+          headers: session.headers,
+          mapping: mappingDraft,
+        }),
+      });
+
+      setNotice("已应用新映射并保存模板记忆，下次相同表头会自动匹配。");
+      setMappingOpen(false);
+      setImportProgress(createProgress("完成", rows.length || 1, rows.length || 1));
+    } catch (mapError) {
+      setError(mapError instanceof Error ? mapError.message : "映射应用失败。");
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  async function exportPreview() {
+    if (!rows.length) {
+      setNotice("当前没有可导出的预览数据。");
+      return;
+    }
+
+    clearFeedback();
+    setExportingPreview(true);
+
+    try {
+      const workbook = buildExportWorkbook(rows);
+      await saveWorkbookFile(workbook, buildExportFileName("预览数据导出"));
+      setNotice(`预览数据已导出，共 ${rows.length} 条。`);
+    } catch (exportError) {
+      if (exportError instanceof DOMException && exportError.name === "AbortError") {
+        setNotice("已取消导出。");
+      } else {
+        setError(exportError instanceof Error ? exportError.message : "导出失败。");
+      }
+    } finally {
+      setExportingPreview(false);
+    }
+  }
+
+  async function submitOrders() {
+    if (!session) {
+      setNotice("请先导入 Excel。");
+      return;
+    }
+
+    if (!rows.length) {
+      setNotice("当前没有可提交的数据。");
+      return;
+    }
+
+    if (validationSummary.invalidCount > 0) {
+      setError("当前仍有错误行，请先修正后再提交下单。");
+      return;
+    }
+
+    clearFeedback();
+    setSubmitting(true);
+    setSubmitProgress(createProgress("准备提交", 0, rows.length));
+
+    try {
+      setSubmitProgress(createProgress("上传运单数据", Math.max(1, Math.floor(rows.length * 0.3)), rows.length));
+      const response = await fetch("/api/orders", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          rows,
+          sourceTemplateName: session.fileName,
+          sourceSheetName: session.selectedSheetName,
+          sourceFingerprint: session.fingerprint,
+        }),
+      });
+      const payload = await readJson<
+        ApiSuccess<{
+          successCount: number;
+          failureCount: number;
+          failures: Array<{ rowNumber: number; reason: string }>;
+        }>
+      >(response);
+
+      if (!response.ok || !payload.data) {
+        throw new Error(payload.error ?? "提交下单失败。");
+      }
+
+      setSubmitProgress(createProgress("完成", rows.length, rows.length));
+      setNotice(
+        `提交完成，成功 ${payload.data.successCount} 条，失败 ${payload.data.failureCount} 条。`,
+      );
+      setRows([]);
+      setSession(null);
+      setMappingDraft(null);
+
+      await loadHistory(1, historyFilters);
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "提交失败。");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const historyTotalPages = Math.max(1, Math.ceil(historyTotal / historyPageSize));
+
+  return (
+    <main className="exam-shell">
+      <aside className="exam-sidebar">
+        <div className="brand-card">
+          <span className="brand-kicker">AI Exam 100</span>
+          <h1>万能导入下单系统</h1>
+          <p>自动识别多模板 Excel，预览修正后批量提交到数据库，并保留公开可访问的历史运单。</p>
+        </div>
+
+        <div className="status-card">
+          <h2>能力清单</h2>
+          <ul>
+            <li>5 种模板自动识别</li>
+            <li>手动列映射 + 模板记忆</li>
+            <li>实时校验 + 重复检测</li>
+            <li>预览导出 + 批量提交</li>
+            <li>历史运单分页检索</li>
+          </ul>
+        </div>
+
+        <div className="status-card">
+          <h2>当前状态</h2>
+          <dl className="metric-list">
+            <div>
+              <dt>预览总数</dt>
+              <dd>{rows.length}</dd>
+            </div>
+            <div>
+              <dt>有效数据</dt>
+              <dd>{validationSummary.validCount}</dd>
+            </div>
+            <div>
+              <dt>错误行数</dt>
+              <dd>{validationSummary.invalidCount}</dd>
+            </div>
+            <div>
+              <dt>历史运单</dt>
+              <dd>{historyTotal}</dd>
+            </div>
+          </dl>
+        </div>
+      </aside>
+
+      <section className="exam-main">
+        <header className="hero-card">
+          <div>
+            <span className="hero-badge">Next.js App Router + TypeScript + Vercel Postgres</span>
+            <h2>多模板自动导入下单</h2>
+            <p>
+              支持标题行、列名别名、列顺序变化、说明页、多 Sheet、合并单元格模板。
+              无需整理成统一模板，也能直接导入预览。
+            </p>
+          </div>
+
+          <div className="hero-actions">
+            <button type="button" className="primary-action" onClick={() => fileInputRef.current?.click()}>
+              上传 Excel
+            </button>
+            <button
+              type="button"
+              className="secondary-action"
+              onClick={() => setMappingOpen((current) => !current)}
+              disabled={!session}
+            >
+              手动映射
+            </button>
+            <input
+              ref={fileInputRef}
+              className="hidden-file-input"
+              type="file"
+              accept=".xlsx,.xls"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) {
+                  void handleFile(file);
+                }
+                event.currentTarget.value = "";
+              }}
+            />
+          </div>
+        </header>
+
+        {(notice || error) && (
+          <div className={`feedback-banner${error ? " error" : ""}`}>
+            {error ?? notice}
+          </div>
+        )}
+
+        <section
+          className={`upload-panel${dragging ? " drag-active" : ""}`}
+          onDragOver={(event) => {
+            event.preventDefault();
+            setDragging(true);
+          }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={handleDrop}
+        >
+          <div className="upload-copy">
+            <span className="eyebrow">模块一 · 模板管理与文件导入</span>
+            <h3>拖拽 Excel 到这里，或点击上传</h3>
+            <p>
+              已针对附件中的 5 个模板做兼容，支持自动识别列名别名、列顺序变化、说明 Sheet 与分组表头。
+            </p>
+          </div>
+
+          <button type="button" className="primary-action" onClick={() => fileInputRef.current?.click()}>
+            {importing ? "导入中..." : "选择 Excel 文件"}
+          </button>
+        </section>
+
+        {importProgress ? (
+          <section className="panel">
+            <div className="panel-header">
+              <div>
+                <span className="eyebrow">导入进度</span>
+                <h3>{importProgress.stage}</h3>
+              </div>
+              <strong>{importProgress.percent}%</strong>
+            </div>
+            <div className="progress-track">
+              <div className="progress-bar" style={{ width: `${importProgress.percent}%` }} />
+            </div>
+            <p className="panel-subtle">
+              当前处理 {importProgress.current} / {importProgress.total}
+            </p>
+          </section>
+        ) : null}
+
+        {session ? (
+          <section className="panel">
+            <div className="panel-header">
+              <div>
+                <span className="eyebrow">模板识别结果</span>
+                <h3>{session.fileName}</h3>
+              </div>
+              <div className="pill-group">
+                <span className="pill">Sheet：{session.selectedSheetName}</span>
+                <span className="pill">表头行：第 {session.headerRowIndex + 1} 行</span>
+                <span className="pill">可用数据：{rows.length} 条</span>
+              </div>
+            </div>
+
+            <div className="template-summary-grid">
+              <div className="summary-card">
+                <span>已识别列</span>
+                <strong>
+                  {
+                    Object.values(session.mapping).filter(
+                      (value) => value !== null && value !== undefined,
+                    ).length
+                  }
+                  /{orderColumns.length}
+                </strong>
+              </div>
+              <div className="summary-card">
+                <span>记忆模板</span>
+                <strong>{session.savedRule ? "已命中" : "首次学习"}</strong>
+              </div>
+              <div className="summary-card">
+                <span>错误提示</span>
+                <strong>{validationSummary.messages.length}</strong>
+              </div>
+              <div className="summary-card">
+                <span>可提交行</span>
+                <strong>{validationSummary.validCount}</strong>
+              </div>
+            </div>
+
+            {mappingOpen && mappingDraft ? (
+              <div className="mapping-panel">
+                <div className="mapping-head">
+                  <div>
+                    <h4>手动列映射</h4>
+                    <p>自动识别不理想时，可手动指定 Excel 列与系统字段的对应关系，保存后会自动记忆。</p>
+                  </div>
+                  <button type="button" className="secondary-action" onClick={() => void applyMapping()}>
+                    应用并记忆
+                  </button>
+                </div>
+
+                <div className="mapping-grid">
+                  {orderColumns.map((column) => (
+                    <label key={column.key} className="mapping-field">
+                      <span>
+                        {column.label}
+                        {column.required ? " *" : ""}
+                      </span>
+                      <select
+                        value={
+                          mappingDraft[column.key] === null || mappingDraft[column.key] === undefined
+                            ? ""
+                            : `${mappingDraft[column.key]}`
+                        }
+                        onChange={(event) =>
+                          setMappingDraft((current) =>
+                            current
+                              ? {
+                                  ...current,
+                                  [column.key]:
+                                    event.target.value === "" ? null : Number(event.target.value),
+                                }
+                              : current,
+                          )
+                        }
+                      >
+                        <option value="">未映射</option>
+                        {session.headers.map((header, index) => (
+                          <option key={`${header}-${index}`} value={index}>
+                            {header || `第 ${index + 1} 列`}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </section>
+        ) : null}
+
+        <section className="panel">
+          <div className="panel-header">
+            <div>
+              <span className="eyebrow">模块二 · 数据预览与编辑</span>
+              <h3>类 Excel 预览表格</h3>
+            </div>
+            <div className="toolbar-actions">
+              <button type="button" className="secondary-action" onClick={handleAddEmptyRow} disabled={!session}>
+                新增空行
+              </button>
+              <button
+                type="button"
+                className="secondary-action"
+                onClick={() => void exportPreview()}
+                disabled={!rows.length || exportingPreview}
+              >
+                {exportingPreview ? "导出中..." : "导出预览 Excel"}
+              </button>
+              <button
+                type="button"
+                className="primary-action"
+                onClick={() => void submitOrders()}
+                disabled={!rows.length || submitting}
+              >
+                {submitting ? "提交中..." : "提交下单"}
+              </button>
+            </div>
+          </div>
+
+          {submitProgress ? (
+            <div className="mini-progress">
+              <div className="progress-track">
+                <div className="progress-bar warm" style={{ width: `${submitProgress.percent}%` }} />
+              </div>
+              <p>
+                {submitProgress.stage} {submitProgress.current}/{submitProgress.total}
+              </p>
+            </div>
+          ) : null}
+
+          <div className="table-wrap">
+            <table className="excel-table">
+              <thead>
+                <tr>
+                  <th>行号</th>
+                  {orderColumns.map((column) => (
+                    <th key={column.key} style={{ minWidth: column.width }}>
+                      {column.label}
+                      {column.required ? " *" : ""}
+                    </th>
+                  ))}
+                  <th>操作</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                {rows.length === 0 ? (
+                  <tr>
+                    <td colSpan={orderColumns.length + 2} className="table-empty">
+                      上传 Excel 后，这里会显示所有预览数据，并支持逐格编辑与实时校验。
+                    </td>
+                  </tr>
+                ) : (
+                  rows.map((row) => (
+                    <tr key={row.id} className={Object.keys(row.errors).length > 0 ? "error-row" : ""}>
+                      <td className="row-number">{row.rowNumber}</td>
+                      {orderColumns.map((column) => {
+                        const isEditing =
+                          editingCell?.rowId === row.id && editingCell.field === column.key;
+                        const errorText = getErrorText(row, column.key);
+                        const value = row.values[column.key];
+
+                        return (
+                          <td
+                            key={`${row.id}-${column.key}`}
+                            className={errorText ? "cell-error" : ""}
+                            onClick={() => setEditingCell({ rowId: row.id, field: column.key })}
+                          >
+                            {isEditing ? (
+                              column.inputType === "select" ? (
+                                <select
+                                  autoFocus
+                                  value={value}
+                                  onBlur={() => {
+                                    setEditingCell(null);
+                                    commitValidationAfterEdit();
+                                  }}
+                                  onChange={(event) => handleEditValue(row.id, column.key, event.target.value)}
+                                >
+                                  <option value="">请选择</option>
+                                  {temperatureOptions.map((item) => (
+                                    <option key={item} value={item}>
+                                      {item}
+                                    </option>
+                                  ))}
+                                </select>
+                              ) : (
+                                <input
+                                  autoFocus
+                                  value={value}
+                                  onChange={(event) => handleEditValue(row.id, column.key, event.target.value)}
+                                  onBlur={() => {
+                                    setEditingCell(null);
+                                    commitValidationAfterEdit();
+                                  }}
+                                  onKeyDown={(event) => {
+                                    if (event.key === "Enter" || event.key === "Tab") {
+                                      setEditingCell(null);
+                                      commitValidationAfterEdit();
+                                    }
+                                  }}
+                                />
+                              )
+                            ) : (
+                              <div className="cell-display">
+                                <span>{value || "点击编辑"}</span>
+                                {errorText ? <small>{errorText}</small> : null}
+                              </div>
+                            )}
+                          </td>
+                        );
+                      })}
+                      <td>
+                        <button type="button" className="link-button danger" onClick={() => handleDeleteRow(row.id)}>
+                          删除
+                        </button>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="error-board">
+            <div className="error-board-head">
+              <h4>全量错误列表</h4>
+              <span>{validationSummary.messages.length} 条</span>
+            </div>
+            {validationSummary.messages.length === 0 ? (
+              <p className="success-note">当前预览数据已通过校验，可以直接提交下单。</p>
+            ) : (
+              <ul>
+                {validationSummary.messages.map((message) => (
+                  <li key={message}>{message}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </section>
+
+        <section className="panel">
+          <div className="panel-header">
+            <div>
+              <span className="eyebrow">模块四 · 已导入运单列表</span>
+              <h3>历史运单查询</h3>
+            </div>
+          </div>
+
+          <div className="history-filter-grid">
+            <label>
+              <span>外部编码</span>
+              <input
+                value={draftHistoryFilters.externalCode}
+                onChange={(event) =>
+                  setDraftHistoryFilters((current) => ({
+                    ...current,
+                    externalCode: event.target.value,
+                  }))
+                }
+                placeholder="按外部编码筛选"
+              />
+            </label>
+            <label>
+              <span>收件人姓名</span>
+              <input
+                value={draftHistoryFilters.receiverName}
+                onChange={(event) =>
+                  setDraftHistoryFilters((current) => ({
+                    ...current,
+                    receiverName: event.target.value,
+                  }))
+                }
+                placeholder="按收件人姓名筛选"
+              />
+            </label>
+            <label>
+              <span>开始日期</span>
+              <input
+                type="date"
+                value={draftHistoryFilters.dateFrom}
+                onChange={(event) =>
+                  setDraftHistoryFilters((current) => ({
+                    ...current,
+                    dateFrom: event.target.value,
+                  }))
+                }
+              />
+            </label>
+            <label>
+              <span>结束日期</span>
+              <input
+                type="date"
+                value={draftHistoryFilters.dateTo}
+                onChange={(event) =>
+                  setDraftHistoryFilters((current) => ({
+                    ...current,
+                    dateTo: event.target.value,
+                  }))
+                }
+              />
+            </label>
+          </div>
+
+          <div className="toolbar-actions history-actions">
+            <button
+              type="button"
+              className="primary-action"
+              onClick={() => {
+                setHistoryFilters(draftHistoryFilters);
+                void loadHistory(1, draftHistoryFilters);
+              }}
+            >
+              查询
+            </button>
+            <button
+              type="button"
+              className="secondary-action"
+              onClick={() => {
+                setDraftHistoryFilters(emptyFilters);
+                setHistoryFilters(emptyFilters);
+                void loadHistory(1, emptyFilters);
+              }}
+            >
+              重置
+            </button>
+          </div>
+
+          <div className="table-wrap">
+            <table className="history-table">
+              <thead>
+                <tr>
+                  <th>提交时间</th>
+                  <th>外部编码</th>
+                  <th>发件人</th>
+                  <th>收件人</th>
+                  <th>重量</th>
+                  <th>件数</th>
+                  <th>温层</th>
+                  <th>来源模板</th>
+                </tr>
+              </thead>
+              <tbody>
+                {historyLoading ? (
+                  <tr>
+                    <td colSpan={8} className="table-empty">
+                      正在加载历史运单...
+                    </td>
+                  </tr>
+                ) : historyRows.length === 0 ? (
+                  <tr>
+                    <td colSpan={8} className="table-empty">
+                      暂无符合条件的历史运单。
+                    </td>
+                  </tr>
+                ) : (
+                  historyRows.map((item) => (
+                    <tr key={item.id}>
+                      <td>{new Date(item.submittedAt).toLocaleString("zh-CN")}</td>
+                      <td>{item.externalCode || "-"}</td>
+                      <td>{item.senderName}</td>
+                      <td>{item.receiverName}</td>
+                      <td>{item.weightKg}</td>
+                      <td>{item.quantity}</td>
+                      <td>{item.temperature}</td>
+                      <td>{item.sourceTemplateName || "-"}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="pagination">
+            <button
+              type="button"
+              className="secondary-action"
+              disabled={historyPage <= 1}
+              onClick={() => void loadHistory(historyPage - 1, historyFilters)}
+            >
+              上一页
+            </button>
+            <span>
+              第 {historyPage} / {historyTotalPages} 页，共 {historyTotal} 条
+            </span>
+            <button
+              type="button"
+              className="secondary-action"
+              disabled={historyPage >= historyTotalPages}
+              onClick={() => void loadHistory(historyPage + 1, historyFilters)}
+            >
+              下一页
+            </button>
+          </div>
+        </section>
+      </section>
+    </main>
+  );
+}
