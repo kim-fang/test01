@@ -4,7 +4,9 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:local": "bash scripts/with-system-ca.sh npm run dev",
     "build": "next build",
+    "build:local": "bash scripts/with-system-ca.sh npm run build",
     "start": "next start",
     "lint": "eslint .",
     "db:init": "node scripts/init-db.mjs",

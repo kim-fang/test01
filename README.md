@@ -33,6 +33,13 @@ npm run db:init
 npm run dev
 ```
 
+如果本机上的 Node 访问 `registry.npmjs.org` 时出现 `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`，可以改用下面的本地命令，它会先加载 macOS 系统根证书再启动：
+
+```bash
+npm run build:local
+npm run dev:local
+```
+
 ## 环境变量
 
 复制 `.env.example` 为 `.env.local`，填写数据库连接串。
@@ -55,4 +62,3 @@ npm run dev
 - 选填字段缺失不会阻断导入
 - 重复外部编码会同时检查本批次和历史库
 - 历史查询支持开始 / 结束日期筛选，开始日期不能晚于结束日期
-
